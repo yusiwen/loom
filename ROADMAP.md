@@ -16,18 +16,17 @@ Target: ~60,000–80,000 lines of Rust, organized as a Cargo workspace.
 | 2 | `loom-ipc` (serde message framing, mio event loop) | ✅ | 9 |
 | 3 | `loom-tty` (terminfo, termios raw mode, output commands) | ✅ | 3 |
 | 4 | `loom-input` (VT100 state machine, CSI/ESC dispatch) | ✅ | 5 |
-| 5 | `loom-server` + `loom` binary (session/window/pane, socket, dispatch, PTY spawn, client) | 🔄 | 27 |
+| 5 | `loom-server` + `loom` binary (session/window/pane, socket, dispatch, PTY spawn, client) | ✅ | 27 |
 | 6 | `loom-commands` + `loom-config` | 📋 | — |
 
 **Total:** ~4,200 lines of Rust across 5 crates.
 
 ## Recommended Next Steps
 
-1. **Client binary** — `loom` entry point: connect to server, send identify, submit commands
-2. **PTY spawn** — forkpty + child process I/O for running shells in panes
-3. **Screen redraw** — scene caching + tty draw pipeline
-4. **Layout split/resize** — complete pane split/grow/shrink operations
-5. **Copy/tree modes** — interactive pane modes
+1. **Screen redraw** — scene caching + tty draw pipeline (needed to see pane output)
+2. **Layout split/resize** — complete pane split/grow/shrink operations
+3. **Copy/tree modes** — interactive pane modes
+4. **Phase 6** — command system + config parser
 
 ## Design Decisions
 
@@ -105,7 +104,7 @@ Target: ~60,000–80,000 lines of Rust, organized as a Cargo workspace.
 
 **Remaining (deferred):** OSC dispatch (title, palette, clipboard), DCS passthrough (Sixel).
 
-## Phase 5: Client-Server & Session Management (🔄 In Progress)
+## Phase 5: Client-Server & Session Management (✅ Complete)
 
 **Crates:** `loom-server`, `loom-client`
 
@@ -159,7 +158,6 @@ loom/                  # Binary entry point (phase 5) ✅
 ├── loom-tty/          # TTY I/O (phase 3) ✅
 ├── loom-input/        # Terminal emulation (phase 4) ✅
 ├── loom-server/       # Server main loop (phase 5) ✅
-├── loom-client/       # Client (phase 5)          📋
 ├── loom-commands/     # Command definitions (phase 6)
 └── loom-config/       # Config parser (phase 6)
 ```
@@ -171,7 +169,7 @@ Terminal → [loom-tty] → [loom-input] → Screen Grid → [loom-server]
                 ↑                                          |
                 |                                     [loom-ipc]
                 |                                          |
-                +------- Client TTY ← [loom-client] ←------+
+                +------- Client TTY ← [loom] ←-------------+
 ```
 
 ## Notes
