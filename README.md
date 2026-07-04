@@ -12,7 +12,7 @@ Loom aims to be a faithful Rust reimplementation of tmux's architecture and feat
 - **`loom-ipc`** — serde message types, framed peer protocol, mio event loop (9 tests)
 - **`loom-tty`** — Terminfo loading, termios raw mode, output buffer, SGR/colour commands (3 tests)
 - **`loom-input`** — VT100/xterm escape sequence parser, CSI/ESC dispatch, SGR, cursor movement (5 tests)
-- **`loom-server`** — Unix socket creation, accept, client dispatch, session/window lifecycle, identify phase, PTY spawn (2 tests)
+- **`loom-server`** — Unix socket creation, accept, client dispatch, session/window lifecycle, identify phase, PTY spawn, layout split/resize, window redraw (3 tests)
 - **`loom-commands`** — Command trait + registry, nom parser, 7 core commands (3 tests)
 - **`loom`** — Binary entry point: start server, connect, send identify + commands (end-to-end)
 

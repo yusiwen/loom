@@ -16,7 +16,7 @@ Target: ~60,000–80,000 lines of Rust, organized as a Cargo workspace.
 | 2 | `loom-ipc` (serde message framing, mio event loop) | ✅ | 9 |
 | 3 | `loom-tty` (terminfo, termios raw mode, output commands) | ✅ | 3 |
 | 4 | `loom-input` (VT100 state machine, CSI/ESC dispatch) | ✅ | 5 |
-| 5 | `loom-server` + `loom` binary (session/window/pane, socket, dispatch, PTY spawn, client) | ✅ | 27 |
+| 5 | `loom-server` + `loom` binary (session/window/pane, socket, dispatch, PTY spawn, client, redraw, layout split) | ✅ | 28 |
 | 6 | `loom-commands` + `loom-config` (command trait, parser, 7 commands) | 🔄 | 3 |
 
 **Total:** ~4,700 lines of Rust across 6 crates.
@@ -120,20 +120,18 @@ Target: ~60,000–80,000 lines of Rust, organized as a Cargo workspace.
 | Server event loop (mio Poll) | `loom-server/src/server.rs` | ✅ Done |
 | Client dispatch (identify phase, command dispatch) | `loom-server/src/server.rs` | ✅ Done |
 | Basic commands (new-session, kill-session, list-sessions) | `loom-server/src/server.rs` | ✅ Done |
-| Layout split / resize operations | — | 📋 Pending |
+| Layout split / resize operations | `loom-server/src/layout.rs` | ✅ Done |
 | PTY spawn (forkpty + child I/O) | `loom-server/src/spawn.rs` | ✅ Done |
-| Screen redraw (scene caching + tty draw) | — | 📋 Pending |
+| Screen redraw (render window panes to terminal) | `loom-server/src/redraw.rs` | ✅ Done |
 | Client binary (connect + identify flow) | `loom/src/main.rs` | ✅ Done |
 | Copy mode / tree mode / interactive modes | — | 📋 Pending |
 
-**Tests:** 2 passing (loom-server: server + spawn), 25 passing (loom-core session types).
+**Tests:** 3 passing (loom-server: server + spawn + redraw/layout), 25 passing (loom-core session types).
 
 **Key C sources translated:** `session.c`, `window.c` (core), `server.c`, `server-client.c` (core), `layout.c` (basic), `spawn.c` (forkpty).
 
 ### Remaining
 
-- Screen redraw (scene cache → tty draw) — needed to see pane content
-- Layout split/resize — full pane management
 - Copy/tree modes — interactive features
 
 ## Phase 6: Commands & Configuration (🔄 In Progress)

@@ -7,6 +7,7 @@ use crate::screen::Screen;
 pub type SessionId = u32;
 pub type WindowId = u32;
 pub type PaneId = u32;
+pub type LayoutCellIdx = usize;
 
 static mut NEXT_SESSION_ID: SessionId = 0;
 static mut NEXT_WINDOW_ID: WindowId = 0;
@@ -75,7 +76,8 @@ pub struct LayoutCell {
     pub saved_sy: u32,
     pub saved_xoff: i32,
     pub saved_yoff: i32,
-    pub children: Vec<LayoutCell>,
+    pub parent: Option<LayoutCellIdx>,
+    pub children: Vec<LayoutCellIdx>,
     pub pane_id: Option<PaneId>,
 }
 
@@ -92,6 +94,7 @@ impl LayoutCell {
             saved_sy: 0,
             saved_xoff: 0,
             saved_yoff: 0,
+            parent: None,
             children: Vec::new(),
             pane_id: None,
         }
@@ -109,6 +112,7 @@ impl LayoutCell {
             saved_sy: 0,
             saved_xoff: 0,
             saved_yoff: 0,
+            parent: None,
             children: Vec::new(),
             pane_id: None,
         }
@@ -224,8 +228,19 @@ impl Window {
     }
 
     pub fn create_pane(&mut self, sx: u32, sy: u32) -> PaneId {
-        let pane = WindowPane::new(self.id, sx, sy);
+        let mut pane = WindowPane::new(self.id, sx, sy);
         let id = pane.id;
+        // Create layout cell
+        let mut cell = LayoutCell::new_leaf();
+        cell.sx = sx;
+        cell.sy = sy;
+        cell.xoff = 0;
+        cell.yoff = 0;
+        cell.pane_id = Some(id);
+        let cell_idx = self.cells.len();
+        pane.layout_cell = Some(cell_idx);
+        self.cells.push(cell);
+        self.layout_root = Some(cell_idx);
         self.panes.insert(id, pane);
         self.pane_order.push_back(id);
         if self.active_pane_id.is_none() {
