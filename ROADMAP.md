@@ -18,15 +18,16 @@ Target: ~60,000–80,000 lines of Rust, organized as a Cargo workspace.
 | 4 | `loom-input` (VT100 state machine, CSI/ESC dispatch) | ✅ | 5 |
 | 5 | `loom-server` + `loom` binary (session/window/pane, socket, dispatch, PTY spawn, client, redraw, layout split) | ✅ | 28 |
 | 6 | `loom-commands` + `loom-config` (21 commands, queue, format, config parser) | ✅ | 13 |
+| 7 | Interactive I/O loop (raw mode, PTY I/O, ScreenUpdate, attach) | 🔄 | — |
 
-**Total:** ~5,900 lines of Rust across 6 crates + 1 binary.
+**Total:** ~5,900 lines of Rust across 6 crates + 1 binary. (Target: ~7,000+ after Phase 7.)
 
 ## Recommended Next Steps
 
-1. **Key binding tables** — key table + prefix key support for interactive use
-2. **Status line** — render status bar with format strings
-3. **Copy mode** — interactive scrollback search/selection
-4. **Mouse support** — click to select/resize panes
+1. **Phase 7: Interactive I/O loop** — connect TTY input → PTS → redraw output cycle
+2. **Key binding tables** — key table + prefix key support
+3. **Status line** — render status bar with format strings
+4. **Copy mode** — interactive scrollback search/selection
 
 ## Design Decisions
 
@@ -157,6 +158,38 @@ Target: ~60,000–80,000 lines of Rust, organized as a Cargo workspace.
 
 **Key C sources translated:** `cmd.c` (command table), `cmd-new-session.c`, `cmd-new-window.c`, `cmd-kill-session.c`, `cmd-list-sessions.c`, `cmd-split-window.c`, `cmd-select-pane.c`, `cmd-send-keys.c`, `cmd-resize-pane.c`, `cmd-kill-pane.c`, `cmd-swap-pane.c`, `cmd-switch-client.c`, `cmd-attach-session.c`, `cmd-detach-client.c`, `cmd-set-option.c`, `cmd-list-windows.c`, `cmd-list-panes.c`, `arguments.c` (basic), `cmd-parse.y` (basic nom replacement).
 
+## Phase 7: Interactive I/O Loop (🔄 In Progress)
+
+**Goal:** Make `loom attach` work — client TTY raw mode, bidirectional I/O with pane PTY, live redraw.
+
+**New IPC messages:**
+- `KeyPress { key: String }` — client → server: forward keystroke to pane
+- `ScreenUpdate { data: Vec<u8> }` — server → client: ANSI redraw data for client stdout
+- `AttachSession` — client → server: request to enter interactive attach mode
+
+| Module | File | Status |
+|--------|------|--------|
+| IPC message types (KeyPress, ScreenUpdate, AttachSession) | `loom-ipc/src/message.rs` | 📋 Pending |
+| Client run_attached (raw mode, mio stdin/stdout loop) | `loom/src/main.rs` | 📋 Pending |
+| Server AttachSession handler (subscribe client to pane I/O) | `loom-server/src/server.rs` | 📋 Pending |
+| Server PTY read → InputCtx parse → redraw → ScreenUpdate | `loom-server/src/server.rs` | 📋 Pending |
+| Client ScreenUpdate → write stdout → flush | `loom/src/main.rs` | 📋 Pending |
+| SIGWINCH → Resize message | `loom/src/main.rs` | 📋 Pending |
+
+### Data Flow (attach mode)
+
+```
+Client stdin  → [mio] → KeyPress msg → Server → write(PTY master)
+                                                      │
+                                               [InputCtx::parse_buf]
+                                                      │
+                                              pane.screen updated
+                                                      │
+                                               redraw_window()
+                                                      │
+Client stdout ← [mio] ← ScreenUpdate msg ←── Server ←┘
+```
+
 ## Architecture
 
 ```
@@ -172,11 +205,24 @@ loom/                  # Binary entry point (phase 5) ✅
 ## Data Flow
 
 ```
-Terminal → [loom-tty] → [loom-input] → Screen Grid → [loom-server]
-                ↑                                          |
-                |                                     [loom-ipc]
-                |                                          |
-                +------- Client TTY ← [loom] ←-------------+
+                    ┌─────────────────────────────────────────┐
+                    │              loom server                 │
+                    │  ┌──────────┐   ┌──────────┐            │
+Client stdin ───────┼─▶│ PTY I/O  │──▶│ InputCtx │──▶ Grid   │
+                    │  │ (mio)    │   │ (VT100)  │    update  │
+                    │  └──────────┘   └──────────┘            │
+                    │       │              │                  │
+                    │       │              ▼                  │
+                    │  ┌──────────┐   ┌──────────┐            │
+Client stdout ◀─────┼──│ IPC send │◀──│ redraw() │           │
+                    │  │ msg      │   │ (ANSI)   │            │
+                    │  └──────────┘   └──────────┘            │
+                    │       ▲                                 │
+                    │  ┌──────────┐                            │
+                    │  │ Attach   │                            │
+                    │  │ handler  │                            │
+                    │  └──────────┘                            │
+                    └─────────────────────────────────────────┘
 ```
 
 ## Notes

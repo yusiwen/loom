@@ -4,7 +4,7 @@ A terminal multiplexer written in Rust, inspired by [tmux](https://github.com/tm
 
 Loom aims to be a faithful Rust reimplementation of tmux's architecture and feature set, built from the ground up with safety, clarity, and modern tooling in mind. It is **not** a drop-in replacement — it is a module-level rewrite that preserves tmux's proven design while leveraging Rust's type system and ecosystem.
 
-> **Status:** Early development. Phases 1–6 complete: core types, IPC, TTY I/O, VT100 emulation, server, spawn, client binary, command system, config parser, format expansion. See [ROADMAP.md](ROADMAP.md).
+> **Status:** Phases 1–6 complete, Phase 7 (interactive I/O loop) in progress. Not yet usable as a terminal multiplexer — see [ROADMAP.md](ROADMAP.md).
 
 ## Completed
 
