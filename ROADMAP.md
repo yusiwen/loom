@@ -33,29 +33,37 @@ Target: ~60,000–80,000 lines of Rust, organized as a Cargo workspace.
 
 **Tests:** 20 passing, 0 warnings, 0 errors.
 
-## Phase 2: IPC Layer & Event Loop (📋 Pending)
+## Phase 2: IPC Layer & Event Loop (✅ Complete)
 
 **Crate:** `loom-ipc`
 
-- Define IPC message types with serde + bincode
-- Implement `TmuxProc` / `TmuxPeer` process abstraction
-- mio event loop (signal handling, timers)
-- UnixStream-based client-server connection
-- SCM_RIGHTS file descriptor passing
+| Module | File | Status |
+|--------|------|--------|
+| Message types (serde enum) | `message.rs` | ✅ Done |
+| Peer (framed send/recv over UnixStream) | `peer.rs` | ✅ Done |
+| Proc (mio event loop, peer management) | `proc.rs` | ✅ Done |
 
-**Key C sources to translate:** `proc.c`, `tmux-protocol.h`, `compat/imsg/*`
+**Tests:** 9 passing, 0 warnings, 0 errors.
 
-## Phase 3: TTY & Terminal I/O (📋 Pending)
+**Key C sources translated:** `proc.c`, `tmux-protocol.h`
+
+**Remaining:** SCM_RIGHTS fd passing (deferred to phase 5 when PTY is needed).
+
+## Phase 3: TTY & Terminal I/O (✅ Complete)
 
 **Crate:** `loom-tty`
 
-- TTY raw mode (termios) via nix crate
-- Terminfo capability loading via terminfo crate
-- Output buffering and cursor/colour/region commands
-- Keyboard input parsing (trie-based key matching)
-- Alternate character set (ACS) mapping
+| Module | File | Status |
+|--------|------|--------|
+| Terminfo capability loading (terminfo crate) | `terminfo.rs` | ✅ Done |
+| TTY raw mode (termios via nix) | `tty.rs` | ✅ Done |
+| Output buffer and cursor/colour/region commands | `tty.rs` | ✅ Done |
 
-**Key C sources to translate:** `tty.c`, `tty-term.c`, `tty-keys.c`, `tty-draw.c`, `tty-acs.c`, `tty-features.c`
+**Tests:** 3 passing, 0 warnings, 0 errors.
+
+**Key C sources translated:** `tty.c`, `tty-term.c` (core).
+
+**Remaining (deferred):** Keyboard input trie parsing (`tty-keys.c`), ACS mapping (`tty-acs.c`), cell drawing (`tty-draw.c`).
 
 ## Phase 4: Terminal Emulator (📋 Pending)
 
@@ -101,8 +109,8 @@ Target: ~60,000–80,000 lines of Rust, organized as a Cargo workspace.
 ```
 loom/                  # Binary entry point
 ├── loom-core/         # Core types (phase 1) ✅
-├── loom-ipc/          # IPC + event loop (phase 2)
-├── loom-tty/          # TTY I/O (phase 3)
+├── loom-ipc/          # IPC + event loop (phase 2) ✅
+├── loom-tty/          # TTY I/O (phase 3) ✅
 ├── loom-input/        # Terminal emulation (phase 4)
 ├── loom-server/       # Server main loop (phase 5)
 ├── loom-client/       # Client (phase 5)

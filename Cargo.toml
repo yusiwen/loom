@@ -1,3 +1,3 @@
 [workspace]
-members = ["loom-core", "loom-ipc"]
+members = ["loom-core", "loom-ipc", "loom-tty"]
 resolver = "2"
