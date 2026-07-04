@@ -13,6 +13,7 @@ use loom_ipc::peer::Peer;
 use loom_input::input::InputCtx;
 
 use crate::redraw;
+use crate::spawn as spawner;
 
 /// Token for the accept listener.
 const ACCEPT_TOKEN: Token = Token(0);
@@ -198,6 +199,29 @@ impl Server {
             }
         }
         Ok(())
+    }
+
+    /// Create a pane with a spawned shell process.
+    fn spawn_pane(&mut self, wid: WindowId, sx: u32, sy: u32, cwd: &str) -> Option<PaneId> {
+        let window = self.windows.get_mut(&wid)?;
+        let pid = window.create_pane(sx, sy);
+
+        // Try to spawn a shell in the pane
+        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+        match spawner::spawn_pty(&[shell.clone()], cwd, sx, sy) {
+            Ok((child_pid, master_fd)) => {
+                if let Some(pane) = window.panes.get_mut(&pid) {
+                    pane.fd = Some(master_fd);
+                    pane.pid = Some(child_pid.as_raw() as u32);
+                    pane.shell = shell;
+                    pane.cwd = cwd.to_string();
+                }
+            }
+            Err(e) => {
+                eprintln!("spawn_pty failed: {}", e);
+            }
+        }
+        Some(pid)
     }
 
     fn handle_accept(&mut self) -> io::Result<()> {
@@ -414,10 +438,12 @@ impl Server {
                                 .unwrap_or_else(|| "/tmp".to_string());
                             let mut session = Session::new(None, &cwd);
                             let mut window = Window::new(80, 24);
-                            let _pid = window.create_pane(80, 24);
                             let wid = window.id;
-                            session.attach_window(0, wid);
 
+                            // Create pane with shell
+                            let _pane_id = self.spawn_pane(wid, 80, 24, &cwd);
+
+                            session.attach_window(0, wid);
                             let sid = session.id;
                             self.windows.insert(wid, window);
                             self.sessions.insert(sid, session);
