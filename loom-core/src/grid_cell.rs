@@ -38,7 +38,7 @@ pub const GRID_ATTR_ALL_UNDERSCORE: u16 = GRID_ATTR_UNDERSCORE
     | GRID_ATTR_UNDERSCORE_4
     | GRID_ATTR_UNDERSCORE_5;
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Default)]
 pub struct GridCell {
     pub data: Utf8Data,
     pub attr: u16,

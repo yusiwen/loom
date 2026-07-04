@@ -17,7 +17,7 @@ Target: ~60,000–80,000 lines of Rust, organized as a Cargo workspace.
 | 3 | `loom-tty` (terminfo, termios raw mode, output commands) | ✅ | 3 |
 | 4 | `loom-input` (VT100 state machine, CSI/ESC dispatch) | ✅ | 5 |
 | 5 | `loom-server` + `loom` binary (session/window/pane, socket, dispatch, PTY spawn, client, redraw, layout split) | ✅ | 28 |
-| 6 | `loom-commands` + `loom-config` (command trait, parser, 7 commands) | 🔄 | 3 |
+| 6 | `loom-commands` + `loom-config` (command trait, parser, 21 commands) | 🔄 | 3 |
 
 **Total:** ~5,200 lines of Rust across 7 crates.
 
@@ -142,19 +142,21 @@ Target: ~60,000–80,000 lines of Rust, organized as a Cargo workspace.
 | Command trait + CmdCtx + Registry | `loom-commands/src/cmd.rs` | ✅ Done |
 | Command parser (nom-based flags + positional) | `loom-commands/src/parser.rs` | ✅ Done |
 | Core commands (new-session, kill-session, list-sessions) | `loom-commands/src/commands.rs` | ✅ Done |
-| Window commands (new-window, kill-window) | `loom-commands/src/commands.rs` | ✅ Done |
-| Rename/has commands | `loom-commands/src/commands.rs` | ✅ Done |
+| Window/pane commands (new-window, kill-window, list-windows, list-panes) | `loom-commands/src/commands.rs` | ✅ Done |
+| Pane management (split-window, select-pane, resize-pane, kill-pane, swap-pane) | `loom-commands/src/commands.rs` | ✅ Done |
+| Navigation (select-window, switch-client, send-keys) | `loom-commands/src/commands.rs` | ✅ Done |
+| Session commands (attach-session, detach-client, rename-session, has-session) | `loom-commands/src/commands.rs` | ✅ Done |
+| Options commands (set-option, show-options, list-commands) | `loom-commands/src/commands.rs` | ✅ Done |
+| Target resolution (-t flag parsing) | `loom-commands/src/commands.rs` | ✅ Done |
 | Config file parser (nom) | — | 📋 Pending |
 | Command queue (stateful sequential execution) | — | 📋 Pending |
-| All ~60 tmux commands | — | 📋 Pending |
-| Target resolution (-t flag parsing) | — | 📋 Pending |
 | Format string expansion (#{} syntax) | — | 📋 Pending |
 | Key binding tables | — | 📋 Pending |
 | Status line, prompts, menus, popups | — | 📋 Pending |
 
 **Tests:** 3 passing.
 
-**Key C sources translated:** `cmd.c` (command table), `cmd-new-session.c`, `cmd-new-window.c`, `cmd-kill-session.c`, `cmd-list-sessions.c`, `arguments.c` (basic), `cmd-parse.y` (basic nom replacement).
+**Key C sources translated:** `cmd.c` (command table), `cmd-new-session.c`, `cmd-new-window.c`, `cmd-kill-session.c`, `cmd-list-sessions.c`, `cmd-split-window.c`, `cmd-select-pane.c`, `cmd-send-keys.c`, `cmd-resize-pane.c`, `cmd-kill-pane.c`, `cmd-swap-pane.c`, `cmd-switch-client.c`, `cmd-attach-session.c`, `cmd-detach-client.c`, `cmd-set-option.c`, `cmd-list-windows.c`, `cmd-list-panes.c`, `arguments.c` (basic), `cmd-parse.y` (basic nom replacement).
 
 ## Architecture
 
