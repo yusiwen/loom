@@ -31,7 +31,7 @@ Target: ~60,000–80,000 lines of Rust, organized as a Cargo workspace.
 | Screen abstraction | `screen.rs` | ✅ Done |
 | Options tree | `options.rs` | ✅ Done |
 
-**Tests:** 20 passing, 0 warnings, 0 errors.
+**Tests:** 25 passing, 0 warnings, 0 errors.
 
 ## Phase 2: IPC Layer & Event Loop (✅ Complete)
 
@@ -84,19 +84,30 @@ Target: ~60,000–80,000 lines of Rust, organized as a Cargo workspace.
 
 **Remaining (deferred):** OSC dispatch (title, palette, clipboard), DCS passthrough (Sixel).
 
-## Phase 5: Client-Server & Session Management (📋 Pending)
+## Phase 5: Client-Server & Session Management (🔄 In Progress)
 
 **Crates:** `loom-server`, `loom-client`
 
-- Session / Window / Pane lifecycle management
-- Layout cell tree (recursive split algorithm)
-- Client connection, identify phase, message dispatch
-- Server main loop with client I/O
-- Screen redraw logic
-- Process spawning (PTY management)
-- Copy mode, tree mode, customization modes
+| Module | File | Status |
+|--------|------|--------|
+| Session / Winlink / Window / WindowPane types | `loom-core/src/session.rs` | ✅ Done |
+| LayoutCell recursive tree | `loom-core/src/session.rs` | ✅ Done |
+| Session lifecycle (create, attach/detach, set_current) | `loom-core/src/session.rs` | ✅ Done |
+| Window/Pane lifecycle (create, remove, set_active) | `loom-core/src/session.rs` | ✅ Done |
+| Server socket creation (AF_UNIX bind+listen) | `loom-server/src/server.rs` | ✅ Done |
+| Server accept + peer registration | `loom-server/src/server.rs` | ✅ Done |
+| Server event loop (mio Poll) | `loom-server/src/server.rs` | ✅ Done |
+| Client dispatch (identify phase, command dispatch) | `loom-server/src/server.rs` | ✅ Done |
+| Basic commands (new-session, kill-session, list-sessions) | `loom-server/src/server.rs` | ✅ Done |
+| Layout split / resize operations | — | 📋 Pending |
+| PTY spawn (fork + forkpty) | — | 📋 Pending |
+| Screen redraw (scene caching + tty draw) | — | 📋 Pending |
+| Client binary (connect + identify flow) | — | 📋 Pending |
+| Copy mode / tree mode / interactive modes | — | 📋 Pending |
 
-**Key C sources:** `server.c`, `server-client.c`, `session.c`, `window*.c`, `layout*.c`, `spawn.c`, `resize.c`, `screen-redraw.c`
+**Tests:** 1 passing (loom-server), 25 passing (loom-core session types).
+
+**Key C sources translated:** `session.c`, `window.c` (core), `server.c`, `server-client.c` (core), `layout.c` (basic).
 
 ## Phase 6: Commands & Configuration (📋 Pending)
 
@@ -120,8 +131,8 @@ loom/                  # Binary entry point
 ├── loom-ipc/          # IPC + event loop (phase 2) ✅
 ├── loom-tty/          # TTY I/O (phase 3) ✅
 ├── loom-input/        # Terminal emulation (phase 4) ✅
-├── loom-server/       # Server main loop (phase 5)
-├── loom-client/       # Client (phase 5)
+├── loom-server/       # Server main loop (phase 5) ✅
+├── loom-client/       # Client (phase 5)          📋
 ├── loom-commands/     # Command definitions (phase 6)
 └── loom-config/       # Config parser (phase 6)
 ```
