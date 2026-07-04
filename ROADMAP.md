@@ -19,7 +19,7 @@ Target: ~60,000–80,000 lines of Rust, organized as a Cargo workspace.
 | 5 | `loom-server` + `loom` binary (session/window/pane, socket, dispatch, PTY spawn, client, redraw, layout split) | ✅ | 28 |
 | 6 | `loom-commands` + `loom-config` (21 commands, queue, format, config parser) | ✅ | 13 |
 
-**Total:** ~5,200 lines of Rust across 7 crates.
+**Total:** ~5,900 lines of Rust across 6 crates + 1 binary.
 
 ## Recommended Next Steps
 
@@ -150,8 +150,6 @@ Target: ~60,000–80,000 lines of Rust, organized as a Cargo workspace.
 | Target resolution (-t flag parsing) | `loom-commands/src/commands.rs` | ✅ Done |
 | Config file parser (nom-based) | `loom-commands/src/config.rs` | ✅ Done |
 | Command queue (stateful sequential execution) | `loom-commands/src/queue.rs` | ✅ Done |
-| Format string expansion (#{} syntax) | `loom-commands/src/format.rs` | ✅ Done |
-| Format string expansion (#{} syntax) | — | 📋 Pending |
 | Key binding tables | — | 📋 Pending |
 | Status line, prompts, menus, popups | — | 📋 Pending |
 
@@ -168,8 +166,7 @@ loom/                  # Binary entry point (phase 5) ✅
 ├── loom-tty/          # TTY I/O (phase 3) ✅
 ├── loom-input/        # Terminal emulation (phase 4) ✅
 ├── loom-server/       # Server main loop (phase 5) ✅
-├── loom-commands/     # Command definitions (phase 6) ✅
-└── loom-config/       # Config parser (phase 6)
+├── loom-commands/     # Command definitions + config parser (phase 6) ✅
 ```
 
 ## Data Flow

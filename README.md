@@ -27,7 +27,7 @@ Loom aims to be a faithful Rust reimplementation of tmux's architecture and feat
 - [ ] Copy mode with vi/emacs keybindings
 - [ ] Customizable status line with `#{}` format strings
 - [ ] Key binding tables with multiple prefix modes
-- [ ] Configurable via `~/.loom.conf` (tmux-compatible syntax)
+- [x] Configurable via `~/.loom.conf` (tmux-compatible syntax)
 - [ ] Control mode (`-CC`) for IDE integration
 - [ ] Sixel image support
 - [ ] Popups, menus, and interactive prompts
@@ -41,8 +41,7 @@ loom/                # Binary entry point                                      �
 ├── loom-tty/        # TTY I/O, terminfo, termios, output commands    ✅
 ├── loom-input/      # VT100/xterm escape sequence parser              ✅
 ├── loom-server/     # Server main loop, session/window/pane lifecycle    ✅
-├── loom-commands/   # Command definitions and dispatch                 ✅
-└── loom-config/     # Configuration file parser
+├── loom-commands/   # Command definitions, config parser, format exp   ✅
 ```
 
 The runtime is a **single-threaded event loop** (via `mio`) with a **client-server process model**:
