@@ -1,0 +1,3 @@
+[workspace]
+members = ["loom-core"]
+resolver = "2"
