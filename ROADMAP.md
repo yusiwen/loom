@@ -8,6 +8,27 @@ Reference codebase: `tmux` (~97,000 lines of C across 149 files).
 
 Target: ~60,000–80,000 lines of Rust, organized as a Cargo workspace.
 
+## Progress Summary
+
+| Phase | Crate | Status | Tests |
+|-------|-------|--------|-------|
+| 1 | `loom-core` (Grid, Screen, Colour, Style, UTF-8, Options) | ✅ | 25 |
+| 2 | `loom-ipc` (serde message framing, mio event loop) | ✅ | 9 |
+| 3 | `loom-tty` (terminfo, termios raw mode, output commands) | ✅ | 3 |
+| 4 | `loom-input` (VT100 state machine, CSI/ESC dispatch) | ✅ | 5 |
+| 5 | `loom-server` (session/window/pane, socket, dispatch) | 🔄 | 26 |
+| 6 | `loom-commands` + `loom-config` | 📋 | — |
+
+**Total:** ~4,200 lines of Rust across 5 crates.
+
+## Recommended Next Steps
+
+1. **Client binary** — `loom` entry point: connect to server, send identify, submit commands
+2. **PTY spawn** — forkpty + child process I/O for running shells in panes
+3. **Screen redraw** — scene caching + tty draw pipeline
+4. **Layout split/resize** — complete pane split/grow/shrink operations
+5. **Copy/tree modes** — interactive pane modes
+
 ## Design Decisions
 
 | Decision | Choice | Rationale |
@@ -108,6 +129,16 @@ Target: ~60,000–80,000 lines of Rust, organized as a Cargo workspace.
 **Tests:** 1 passing (loom-server), 25 passing (loom-core session types).
 
 **Key C sources translated:** `session.c`, `window.c` (core), `server.c`, `server-client.c` (core), `layout.c` (basic).
+
+### Remaining Priority
+
+| Priority | Task | Why |
+|----------|------|-----|
+| 1 | Client binary (connect + identify) | Enables end-to-end testing |
+| 2 | PTY spawn (forkpty) | Runs real processes in panes |
+| 3 | Screen redraw (scene cache → tty) | Displays pane content |
+| 4 | Layout split/resize | Pane management UX |
+| 5 | Copy/tree modes | Interactive features |
 
 ## Phase 6: Commands & Configuration (📋 Pending)
 
