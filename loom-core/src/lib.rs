@@ -2,6 +2,7 @@ pub mod colour;
 pub mod grid_cell;
 pub mod options;
 pub mod screen;
+pub mod session;
 pub mod style;
 pub mod utf8;
 
