@@ -19,15 +19,14 @@ Target: ~60,000–80,000 lines of Rust, organized as a Cargo workspace.
 | 5 | `loom-server` + `loom` binary (session/window/pane, socket, dispatch, PTY spawn, client, redraw, layout split) | ✅ | 28 |
 | 6 | `loom-commands` + `loom-config` (command trait, parser, 7 commands) | 🔄 | 3 |
 
-**Total:** ~4,700 lines of Rust across 6 crates.
+**Total:** ~5,200 lines of Rust across 7 crates.
 
 ## Recommended Next Steps
 
-1. **More commands (~60 total)** — fill out remaining tmux commands
-2. **Config parser** — nom-based `.loom.conf` parser
-3. **Screen redraw** — scene caching + tty draw pipeline
-4. **Layout split/resize** — complete pane split/grow/shrink operations
-5. **Copy/tree modes** — interactive pane modes
+1. **Fill out ~60 commands** — split-window, select-pane, send-keys, resize-pane, kill-pane, switch-client, set-option, bind-key, list-windows, list-panes ...
+2. **Command queue** (cmdq) — stateful sequential execution for `bind-key` multi-command and `if-shell`
+3. **Config parser** — nom-based `.loom.conf` parser
+4. **Copy/tree modes** — interactive pane modes
 
 ## Design Decisions
 
@@ -166,7 +165,7 @@ loom/                  # Binary entry point (phase 5) ✅
 ├── loom-tty/          # TTY I/O (phase 3) ✅
 ├── loom-input/        # Terminal emulation (phase 4) ✅
 ├── loom-server/       # Server main loop (phase 5) ✅
-├── loom-commands/     # Command definitions (phase 6)
+├── loom-commands/     # Command definitions (phase 6) 🔄
 └── loom-config/       # Config parser (phase 6)
 ```
 
