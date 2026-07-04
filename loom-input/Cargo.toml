@@ -1,0 +1,7 @@
+[package]
+name = "loom-input"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+loom-core = { path = "../loom-core" }

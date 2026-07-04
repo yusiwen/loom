@@ -1,5 +1,5 @@
 use std::io;
-use std::os::unix::io::{AsRawFd, BorrowedFd, RawFd};
+use std::os::unix::io::{BorrowedFd, RawFd};
 
 use nix::sys::termios;
 use nix::unistd;
@@ -362,6 +362,7 @@ mod tests {
 
     #[test]
     fn test_tty_smoke() {
+        use std::os::unix::io::AsRawFd;
         let fd = std::fs::File::open("/dev/null")
             .map(|f| f.as_raw_fd())
             .unwrap_or(0);

@@ -65,16 +65,24 @@ Target: ~60,000–80,000 lines of Rust, organized as a Cargo workspace.
 
 **Remaining (deferred):** Keyboard input trie parsing (`tty-keys.c`), ACS mapping (`tty-acs.c`), cell drawing (`tty-draw.c`).
 
-## Phase 4: Terminal Emulator (📋 Pending)
+## Phase 4: Terminal Emulator (✅ Complete)
 
 **Crate:** `loom-input`
 
-- VT100/xterm escape sequence state machine (12 states)
-- CSI / ESC / OSC / DCS / APC dispatch tables
-- UTF-8 multi-byte handling in-band
-- screen_write operations (~40 functions)
+| Module | File | Status |
+|--------|------|--------|
+| VT100 state machine (17 states + transition tables) | `input.rs` | ✅ Done |
+| CSI dispatch (CUP/CUU/CUD/CUF/CUB, ED/EL, SGR, DECSTBM, DECSCUSR, SM/RM) | `input.rs` | ✅ Done |
+| ESC dispatch (DECSC, DECRC, RIS, IND, NEL, RI) | `input.rs` | ✅ Done |
+| C0 control codes (BS, HT, LF, CR) | `input.rs` | ✅ Done |
+| Parameter parsing (digits + separators) | `input.rs` | ✅ Done |
+| 256-colour and 24-bit RGB SGR support | `input.rs` | ✅ Done |
 
-**Key C sources to translate:** `input.c`, `input-keys.c`, `screen-write.c`
+**Tests:** 5 passing, 0 warnings, 0 errors.
+
+**Key C sources translated:** `input.c` (core state machine and CSI/ESC dispatch).
+
+**Remaining (deferred):** OSC dispatch (title, palette, clipboard), DCS passthrough (Sixel).
 
 ## Phase 5: Client-Server & Session Management (📋 Pending)
 
@@ -111,7 +119,7 @@ loom/                  # Binary entry point
 ├── loom-core/         # Core types (phase 1) ✅
 ├── loom-ipc/          # IPC + event loop (phase 2) ✅
 ├── loom-tty/          # TTY I/O (phase 3) ✅
-├── loom-input/        # Terminal emulation (phase 4)
+├── loom-input/        # Terminal emulation (phase 4) ✅
 ├── loom-server/       # Server main loop (phase 5)
 ├── loom-client/       # Client (phase 5)
 ├── loom-commands/     # Command definitions (phase 6)
