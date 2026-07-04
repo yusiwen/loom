@@ -17,16 +17,17 @@ Target: ~60,000–80,000 lines of Rust, organized as a Cargo workspace.
 | 3 | `loom-tty` (terminfo, termios raw mode, output commands) | ✅ | 3 |
 | 4 | `loom-input` (VT100 state machine, CSI/ESC dispatch) | ✅ | 5 |
 | 5 | `loom-server` + `loom` binary (session/window/pane, socket, dispatch, PTY spawn, client) | ✅ | 27 |
-| 6 | `loom-commands` + `loom-config` | 📋 | — |
+| 6 | `loom-commands` + `loom-config` (command trait, parser, 7 commands) | 🔄 | 3 |
 
-**Total:** ~4,200 lines of Rust across 5 crates.
+**Total:** ~4,700 lines of Rust across 6 crates.
 
 ## Recommended Next Steps
 
-1. **Screen redraw** — scene caching + tty draw pipeline (needed to see pane output)
-2. **Layout split/resize** — complete pane split/grow/shrink operations
-3. **Copy/tree modes** — interactive pane modes
-4. **Phase 6** — command system + config parser
+1. **More commands (~60 total)** — fill out remaining tmux commands
+2. **Config parser** — nom-based `.loom.conf` parser
+3. **Screen redraw** — scene caching + tty draw pipeline
+4. **Layout split/resize** — complete pane split/grow/shrink operations
+5. **Copy/tree modes** — interactive pane modes
 
 ## Design Decisions
 
@@ -135,19 +136,28 @@ Target: ~60,000–80,000 lines of Rust, organized as a Cargo workspace.
 - Layout split/resize — full pane management
 - Copy/tree modes — interactive features
 
-## Phase 6: Commands & Configuration (📋 Pending)
+## Phase 6: Commands & Configuration (🔄 In Progress)
 
 **Crates:** `loom-commands`, `loom-config`
 
-- Command definition trait and dispatch (~60 commands)
-- Config file parser using nom
-- Command queue (stateful sequential execution)
-- Target resolution (-t flag parsing)
-- Format string expansion (#{} syntax)
-- Key binding tables
-- Status line, prompts, menus, popups
+| Module | File | Status |
+|--------|------|--------|
+| Command trait + CmdCtx + Registry | `loom-commands/src/cmd.rs` | ✅ Done |
+| Command parser (nom-based flags + positional) | `loom-commands/src/parser.rs` | ✅ Done |
+| Core commands (new-session, kill-session, list-sessions) | `loom-commands/src/commands.rs` | ✅ Done |
+| Window commands (new-window, kill-window) | `loom-commands/src/commands.rs` | ✅ Done |
+| Rename/has commands | `loom-commands/src/commands.rs` | ✅ Done |
+| Config file parser (nom) | — | 📋 Pending |
+| Command queue (stateful sequential execution) | — | 📋 Pending |
+| All ~60 tmux commands | — | 📋 Pending |
+| Target resolution (-t flag parsing) | — | 📋 Pending |
+| Format string expansion (#{} syntax) | — | 📋 Pending |
+| Key binding tables | — | 📋 Pending |
+| Status line, prompts, menus, popups | — | 📋 Pending |
 
-**Key C sources:** `cmd*.c`, `cmd-parse.y`, `cfg.c`, `format*.c`, `key-bindings.c`, `status.c`, `prompt*.c`, `menu.c`, `popup.c`
+**Tests:** 3 passing.
+
+**Key C sources translated:** `cmd.c` (command table), `cmd-new-session.c`, `cmd-new-window.c`, `cmd-kill-session.c`, `cmd-list-sessions.c`, `arguments.c` (basic), `cmd-parse.y` (basic nom replacement).
 
 ## Architecture
 

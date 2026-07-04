@@ -1,0 +1,10 @@
+[package]
+name = "loom-commands"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+nom = "7"
+loom-core = { path = "../loom-core" }
+loom-ipc = { path = "../loom-ipc" }
+loom-server = { path = "../loom-server" }
