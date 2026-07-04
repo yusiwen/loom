@@ -4,7 +4,7 @@ A terminal multiplexer written in Rust, inspired by [tmux](https://github.com/tm
 
 Loom aims to be a faithful Rust reimplementation of tmux's architecture and feature set, built from the ground up with safety, clarity, and modern tooling in mind. It is **not** a drop-in replacement — it is a module-level rewrite that preserves tmux's proven design while leveraging Rust's type system and ecosystem.
 
-> **Status:** Early development. Phases 1–5 in progress: core types, IPC, TTY I/O, VT100 emulation, and server infrastructure are complete. See [ROADMAP.md](ROADMAP.md).
+> **Status:** Early development. Phases 1–5 core complete: core types, IPC, TTY I/O, VT100 emulation, server, spawn, and client binary. See [ROADMAP.md](ROADMAP.md).
 
 ## Completed
 
@@ -12,7 +12,8 @@ Loom aims to be a faithful Rust reimplementation of tmux's architecture and feat
 - **`loom-ipc`** — serde message types, framed peer protocol, mio event loop (9 tests)
 - **`loom-tty`** — Terminfo loading, termios raw mode, output buffer, SGR/colour commands (3 tests)
 - **`loom-input`** — VT100/xterm escape sequence parser, CSI/ESC dispatch, SGR, cursor movement (5 tests)
-- **`loom-server`** — Unix socket creation, accept, client dispatch, session/window lifecycle, identify phase (1 test)
+- **`loom-server`** — Unix socket creation, accept, client dispatch, session/window lifecycle, identify phase, PTY spawn (2 tests)
+- **`loom`** — Binary entry point: start server, connect, send identify + commands (end-to-end)
 
 ## Planned Features
 
@@ -33,7 +34,7 @@ Loom aims to be a faithful Rust reimplementation of tmux's architecture and feat
 ## Architecture
 
 ```
-loom/                # Binary entry point
+loom/                # Binary entry point                                      ✅
 ├── loom-core/       # Core types: Grid, Screen, Colour, Style, Options ✅
 ├── loom-ipc/        # Client-server IPC protocol + event loop        ✅
 ├── loom-tty/        # TTY I/O, terminfo, termios, output commands    ✅

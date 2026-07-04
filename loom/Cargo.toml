@@ -1,0 +1,15 @@
+[package]
+name = "loom"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "loom"
+path = "src/main.rs"
+
+[dependencies]
+mio = { version = "1", features = ["net", "os-ext"] }
+nix = { version = "0.29", features = ["fs", "signal"] }
+loom-core = { path = "../loom-core" }
+loom-ipc = { path = "../loom-ipc" }
+loom-server = { path = "../loom-server" }

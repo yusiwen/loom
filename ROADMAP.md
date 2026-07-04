@@ -16,7 +16,7 @@ Target: ~60,000–80,000 lines of Rust, organized as a Cargo workspace.
 | 2 | `loom-ipc` (serde message framing, mio event loop) | ✅ | 9 |
 | 3 | `loom-tty` (terminfo, termios raw mode, output commands) | ✅ | 3 |
 | 4 | `loom-input` (VT100 state machine, CSI/ESC dispatch) | ✅ | 5 |
-| 5 | `loom-server` (session/window/pane, socket, dispatch) | 🔄 | 26 |
+| 5 | `loom-server` + `loom` binary (session/window/pane, socket, dispatch, PTY spawn, client) | 🔄 | 27 |
 | 6 | `loom-commands` + `loom-config` | 📋 | — |
 
 **Total:** ~4,200 lines of Rust across 5 crates.
@@ -121,24 +121,20 @@ Target: ~60,000–80,000 lines of Rust, organized as a Cargo workspace.
 | Client dispatch (identify phase, command dispatch) | `loom-server/src/server.rs` | ✅ Done |
 | Basic commands (new-session, kill-session, list-sessions) | `loom-server/src/server.rs` | ✅ Done |
 | Layout split / resize operations | — | 📋 Pending |
-| PTY spawn (fork + forkpty) | — | 📋 Pending |
+| PTY spawn (forkpty + child I/O) | `loom-server/src/spawn.rs` | ✅ Done |
 | Screen redraw (scene caching + tty draw) | — | 📋 Pending |
-| Client binary (connect + identify flow) | — | 📋 Pending |
+| Client binary (connect + identify flow) | `loom/src/main.rs` | ✅ Done |
 | Copy mode / tree mode / interactive modes | — | 📋 Pending |
 
-**Tests:** 1 passing (loom-server), 25 passing (loom-core session types).
+**Tests:** 2 passing (loom-server: server + spawn), 25 passing (loom-core session types).
 
-**Key C sources translated:** `session.c`, `window.c` (core), `server.c`, `server-client.c` (core), `layout.c` (basic).
+**Key C sources translated:** `session.c`, `window.c` (core), `server.c`, `server-client.c` (core), `layout.c` (basic), `spawn.c` (forkpty).
 
-### Remaining Priority
+### Remaining
 
-| Priority | Task | Why |
-|----------|------|-----|
-| 1 | Client binary (connect + identify) | Enables end-to-end testing |
-| 2 | PTY spawn (forkpty) | Runs real processes in panes |
-| 3 | Screen redraw (scene cache → tty) | Displays pane content |
-| 4 | Layout split/resize | Pane management UX |
-| 5 | Copy/tree modes | Interactive features |
+- Screen redraw (scene cache → tty draw) — needed to see pane content
+- Layout split/resize — full pane management
+- Copy/tree modes — interactive features
 
 ## Phase 6: Commands & Configuration (📋 Pending)
 
@@ -157,7 +153,7 @@ Target: ~60,000–80,000 lines of Rust, organized as a Cargo workspace.
 ## Architecture
 
 ```
-loom/                  # Binary entry point
+loom/                  # Binary entry point (phase 5) ✅
 ├── loom-core/         # Core types (phase 1) ✅
 ├── loom-ipc/          # IPC + event loop (phase 2) ✅
 ├── loom-tty/          # TTY I/O (phase 3) ✅
