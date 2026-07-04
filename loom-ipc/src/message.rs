@@ -72,6 +72,14 @@ pub enum Message {
     /// Client flags.
     Flags(u64),
 
+    // ── Interactive attach mode ──
+    /// Client requests to attach to a session interactively.
+    AttachSession,
+    /// Client sends a keystroke to the attached session.
+    KeyPress { key: Vec<u8> },
+    /// Server sends screen update to the client.
+    ScreenUpdate { data: Vec<u8> },
+
     // ── File I/O (300-level) ──
     /// Open a file for reading.
     ReadOpen { stream: u32 },

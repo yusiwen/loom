@@ -169,11 +169,11 @@ Target: ~60,000–80,000 lines of Rust, organized as a Cargo workspace.
 
 | Module | File | Status |
 |--------|------|--------|
-| IPC message types (KeyPress, ScreenUpdate, AttachSession) | `loom-ipc/src/message.rs` | 📋 Pending |
-| Client run_attached (raw mode, mio stdin/stdout loop) | `loom/src/main.rs` | 📋 Pending |
-| Server AttachSession handler (subscribe client to pane I/O) | `loom-server/src/server.rs` | 📋 Pending |
-| Server PTY read → InputCtx parse → redraw → ScreenUpdate | `loom-server/src/server.rs` | 📋 Pending |
-| Client ScreenUpdate → write stdout → flush | `loom/src/main.rs` | 📋 Pending |
+| IPC message types (KeyPress, ScreenUpdate, AttachSession) | `loom-ipc/src/message.rs` | ✅ Done |
+| Client run_attached (raw mode, mio stdin/stdout loop) | `loom/src/main.rs` | ✅ Done |
+| Server AttachSession handler (subscribe client to pane I/O) | `loom-server/src/server.rs` | ✅ Done |
+| Server PTY read → InputCtx parse → redraw → ScreenUpdate | `loom-server/src/server.rs` | ✅ Done |
+| Client ScreenUpdate → write stdout → flush | `loom/src/main.rs` | ✅ Done |
 | SIGWINCH → Resize message | `loom/src/main.rs` | 📋 Pending |
 
 ### Data Flow (attach mode)

@@ -1,21 +1,29 @@
 use std::collections::HashMap;
 use std::io;
-use std::os::unix::io::{FromRawFd, RawFd};
+use std::os::unix::io::{AsFd, BorrowedFd, FromRawFd, RawFd};
 use std::time::Duration;
 
 use mio::net::UnixStream;
 use mio::{event::Event, Events, Interest, Poll, Registry, Token, Waker};
+use mio::unix::SourceFd;
 
-use loom_core::session::{Session, SessionId, Window, WindowId};
+use loom_core::session::{PaneId, Session, SessionId, Window, WindowId};
 use loom_ipc::message::Message;
 use loom_ipc::peer::Peer;
+use loom_input::input::InputCtx;
+
+use crate::redraw;
 
 /// Token for the accept listener.
 const ACCEPT_TOKEN: Token = Token(0);
-/// First token for client peers.
-const CLIENT_BASE: usize = 256;
 /// Signal notification token.
 const SIGNAL_TOKEN: Token = Token(1);
+/// Waker token.
+const WAKER_TOKEN: Token = Token(2);
+/// First token for client peers.
+const CLIENT_BASE: usize = 256;
+/// First token for PTY fds.
+const PTY_BASE: usize = 512;
 
 /// Server configuration.
 #[derive(Clone)]
@@ -46,6 +54,7 @@ pub struct ClientState {
     pub tty_name: String,
     pub cwd: String,
     pub pid: u32,
+    pub attached: bool,
 }
 
 /// The server manages sessions, windows, clients and the event loop.
@@ -59,13 +68,16 @@ pub struct Server {
     sessions: HashMap<SessionId, Session>,
     windows: HashMap<WindowId, Window>,
     listen_fd: Option<RawFd>,
+    /// Map PTY master fd → (client_token, pane_id)
+    attached_panes: HashMap<RawFd, (Token, PaneId)>,
+    next_pty_token: usize,
     pub exit: bool,
 }
 
 impl Server {
     pub fn new(config: ServerConfig) -> io::Result<Self> {
         let poll = Poll::new()?;
-        let waker = Waker::new(poll.registry(), Token(2))?;
+        let waker = Waker::new(poll.registry(), WAKER_TOKEN)?;
         Ok(Self {
             config,
             poll,
@@ -75,6 +87,8 @@ impl Server {
             sessions: HashMap::new(),
             windows: HashMap::new(),
             listen_fd: None,
+            attached_panes: HashMap::new(),
+            next_pty_token: 0,
             exit: false,
         })
     }
@@ -173,16 +187,13 @@ impl Server {
             }
 
             for event in &events {
-                match event.token() {
-                    ACCEPT_TOKEN => {
-                        self.handle_accept()?;
-                    }
-                    SIGNAL_TOKEN => {
-                        // Signal received
-                    }
-                    token => {
-                        self.handle_client_event(token, event)?;
-                    }
+                let token = event.token();
+                if token == ACCEPT_TOKEN {
+                    self.handle_accept()?;
+                } else if token.0 >= PTY_BASE as usize {
+                    self.handle_pty_event(event)?;
+                } else {
+                    self.handle_client_event(token, event)?;
                 }
             }
         }
@@ -231,6 +242,7 @@ impl Server {
                 tty_name: String::new(),
                 cwd: String::new(),
                 pid: 0,
+                attached: false,
             };
 
             client.peer.register(
@@ -240,6 +252,84 @@ impl Server {
             )?;
 
             self.clients.insert(token, client);
+        }
+
+        Ok(())
+    }
+
+    fn handle_pty_event(&mut self, event: &Event) -> io::Result<()> {
+        let token = event.token();
+
+        // Find the fd for this token
+        let fd = match self.attached_panes.iter()
+            .find(|(_, (t, _))| *t == token)
+            .map(|(&fd, _)| fd)
+        {
+            Some(fd) => fd,
+            None => return Ok(()),
+        };
+
+        if event.is_error() || event.is_read_closed() {
+            self.attached_panes.remove(&fd);
+            return Ok(());
+        }
+
+        if event.is_readable() {
+            let mut buf = vec![0u8; 65536];
+            match nix::unistd::read(fd, &mut buf) {
+                Ok(0) => {
+                    // PTY closed
+                    self.attached_panes.remove(&fd);
+                    return Ok(());
+                }
+                Ok(n) => {
+                    buf.truncate(n);
+
+                    // Get pane and client
+                    let (client_token, pane_id) = match self.attached_panes.get(&fd) {
+                        Some(&(ct, pid)) => (ct, pid),
+                        None => return Ok(()),
+                    };
+                    let client_token = client_token;
+
+                    // Find the window for this pane
+                    let wid = self.windows.iter()
+                        .find(|(_, w)| w.panes.contains_key(&pane_id))
+                        .map(|(&id, _)| id);
+
+                    if let Some(wid) = wid {
+                        if let Some(window) = self.windows.get_mut(&wid) {
+                            if let Some(pane) = window.panes.get_mut(&pane_id) {
+                                // Parse input through VT100 emulator
+                                let screen = &mut pane.screen;
+                                let mut ctx = InputCtx::new(screen);
+                                ctx.parse_buf(&buf);
+                            }
+                        }
+
+                        // Redraw and send update
+                        if let Some(window) = self.windows.get(&wid) {
+                            let mut redraw_buf = Vec::new();
+                            if let Err(e) = redraw::redraw_window(window, &mut redraw_buf) {
+                                eprintln!("redraw error: {}", e);
+                            } else {
+                                self.send_to(client_token, &Message::ScreenUpdate {
+                                    data: redraw_buf,
+                                })?;
+                            }
+                        }
+                    }
+                }
+                Err(nix::errno::Errno::EAGAIN) => {}
+                Err(e) => {
+                    self.attached_panes.remove(&fd);
+                    return Err(io::Error::new(io::ErrorKind::Other, format!("pty read: {}", e)));
+                }
+            }
+        }
+
+        if event.is_writable() {
+            // PTY write readiness - data should already be written
         }
 
         Ok(())
@@ -385,6 +475,61 @@ impl Server {
                                         pane.sx = sx;
                                         pane.sy = sy;
                                         pane.screen.resize(sx, sy);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            Message::AttachSession => {
+                // Find the active pane's PTY fd and register it with mio
+                if let Some(client) = self.clients.get(&token) {
+                    if let Some(sid) = client.session_id {
+                        if let Some(session) = self.sessions.get(&sid) {
+                            if let Some(wl) = session.current_winlink() {
+                                if let Some(window) = self.windows.get(&wl.window_id) {
+                                    if let Some(active_pane_id) = window.active_pane_id {
+                                        if let Some(pane) = window.panes.get(&active_pane_id) {
+                                            if let Some(pfd) = pane.fd {
+                                                // Register PTY fd with event loop
+                                                let pty_token = Token(PTY_BASE + self.next_pty_token);
+                                                self.next_pty_token += 1;
+                                                let mut source = SourceFd(&pfd);
+                                                if self.poll.registry().register(
+                                                    &mut source,
+                                                    pty_token,
+                                                    Interest::READABLE,
+                                                ).is_ok() {
+                                                    self.attached_panes.insert(pfd, (token, active_pane_id));
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                // Mark client as attached
+                if let Some(client) = self.clients.get_mut(&token) {
+                    client.attached = true;
+                }
+            }
+            Message::KeyPress { key } => {
+                // Forward keystrokes to the pane's PTY
+                if let Some(client) = self.clients.get(&token) {
+                    if let Some(sid) = client.session_id {
+                        if let Some(session) = self.sessions.get(&sid) {
+                            if let Some(wl) = session.current_winlink() {
+                                if let Some(window) = self.windows.get(&wl.window_id) {
+                                    if let Some(active_pane_id) = window.active_pane_id {
+                                        if let Some(pane) = window.panes.get(&active_pane_id) {
+                    if let Some(pfd) = pane.fd {
+                                            let bfd = unsafe { BorrowedFd::borrow_raw(pfd) };
+                                            let _ = nix::unistd::write(&bfd, &key);
+                                            }
+                                        }
                                     }
                                 }
                             }
