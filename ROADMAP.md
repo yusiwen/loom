@@ -18,13 +18,13 @@ Target: ~60,000–80,000 lines of Rust, organized as a Cargo workspace.
 | 4 | `loom-input` (VT100 state machine, CSI/ESC dispatch) | ✅ | 5 |
 | 5 | `loom-server` + `loom` binary (session/window/pane, socket, dispatch, PTY spawn, client, redraw, layout split) | ✅ | 28 |
 | 6 | `loom-commands` + `loom-config` (21 commands, queue, format, config parser) | ✅ | 13 |
-| 7 | Interactive I/O loop + integration tests (raw mode, PTY I/O, ScreenUpdate, attach) | 🔄 | 5 |
+| 7 | Interactive I/O loop + integration tests (raw mode, PTY I/O, ScreenUpdate, attach, golden files) | 🔄 | 17 |
 
-**Total:** ~5,900 lines of Rust across 6 crates + 1 binary. (Target: ~7,000+ after Phase 7.)
+**Total:** ~6,400 lines of Rust across 6 crates + 1 binary, ~71 tests (58 unit + 13 integration).
 
 ## Recommended Next Steps
 
-1. **Phase 7: Interactive I/O loop** — connect TTY input → PTS → redraw output cycle
+1. **SIGWINCH handling** — forward terminal resize events to server
 2. **Key binding tables** — key table + prefix key support
 3. **Status line** — render status bar with format strings
 4. **Copy mode** — interactive scrollback search/selection
@@ -175,6 +175,7 @@ Target: ~60,000–80,000 lines of Rust, organized as a Cargo workspace.
 | Server PTY read → InputCtx parse → redraw → ScreenUpdate | `loom-server/src/server.rs` | ✅ Done |
 | Client ScreenUpdate → write stdout → flush | `loom/src/main.rs` | ✅ Done |
 | SIGWINCH → Resize message | `loom/src/main.rs` | 📋 Pending |
+| Golden file test harness (ANSI strip + compare) | `loom-server/tests/redraw_golden.rs` | ✅ Done |
 
 ### Data Flow (attach mode)
 
@@ -249,9 +250,10 @@ Four approaches for testing loom's terminal output, ordered by automation level:
 
 ### Current Status
 
-- **22 unit/integration tests** cover command execution, IPC protocol, format expansion, and queue logic
-- **Golden file approach** not yet implemented — requires a PTY harness to run loom and capture pane output
-- **Next step:** implement a `loom capture-pane -p` equivalent in the test harness, build golden file comparison
+- **~71 tests** cover unit logic, IPC, command execution, format expansion, queue, config parsing, and golden file comparison
+- **Golden file approach (A)** implemented: `loom-server/tests/redraw_golden.rs` with 4 golden files in `tests/golden/`
+- **Usage:** `GENERATE=1 cargo test -p loom-server` to (re)generate; `cargo test -p loom-server` to compare
+- **Next step:** expand golden test coverage (borders, status line, scrollbar)
 
 ## Notes
 

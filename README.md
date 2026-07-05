@@ -4,7 +4,7 @@ A terminal multiplexer written in Rust, inspired by [tmux](https://github.com/tm
 
 Loom aims to be a faithful Rust reimplementation of tmux's architecture and feature set, built from the ground up with safety, clarity, and modern tooling in mind. It is **not** a drop-in replacement — it is a module-level rewrite that preserves tmux's proven design while leveraging Rust's type system and ecosystem.
 
-> **Status:** Phases 1–6 complete, Phase 7 (interactive I/O loop) in progress. Not yet usable as a terminal multiplexer — see [ROADMAP.md](ROADMAP.md).
+> **Status:** Phases 1–6 complete, Phase 7 (interactive I/O loop + golden test framework) in progress. Not yet usable as a terminal multiplexer — see [ROADMAP.md](ROADMAP.md).
 
 ## Completed
 
@@ -12,9 +12,9 @@ Loom aims to be a faithful Rust reimplementation of tmux's architecture and feat
 - **`loom-ipc`** — serde message types, framed peer protocol, mio event loop (9 tests)
 - **`loom-tty`** — Terminfo loading, termios raw mode, output buffer, SGR/colour commands (3 tests)
 - **`loom-input`** — VT100/xterm escape sequence parser, CSI/ESC dispatch, SGR, cursor movement (5 tests)
-- **`loom-server`** — Unix socket creation, accept, client dispatch, session/window lifecycle, identify phase, PTY spawn, layout split/resize, window redraw (3 tests)
-- **`loom-commands`** — Command trait + registry, nom parser, 21 commands, command queue, format expansion (#{}), config parser (13 tests)
-- **`loom`** — Binary entry point: start server, connect, send identify + commands (end-to-end)
+- **`loom-server`** — Unix socket creation, accept, client dispatch, session/window lifecycle, identify phase, PTY spawn, layout split/resize, window redraw, golden file tests (7 tests)
+- **`loom-commands`** — Command trait + registry, nom parser, 21 commands, command queue, format expansion (#{}), config parser, command/format integration tests (22 tests)
+- **`loom`** — Binary entry point: start server, connect, send identify + commands, attach mode (end-to-end)
 
 ## Planned Features
 
