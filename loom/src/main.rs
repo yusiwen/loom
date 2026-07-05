@@ -9,6 +9,7 @@ use nix::sys::termios;
 
 use loom_ipc::message::Message;
 use loom_ipc::peer::Peer;
+use loom_server::server::{Server, ServerConfig};
 
 const STDIN_TOKEN: Token = Token(0);
 const PEER_TOKEN: Token = Token(1);
@@ -26,6 +27,10 @@ fn main() -> io::Result<()> {
 
     if let Some(parent) = std::path::Path::new(&socket_path).parent() {
         let _ = std::fs::create_dir_all(parent);
+    }
+
+    if args.get(1).map(|s| s.as_str()) == Some("start-server") {
+        return start_server(&socket_path);
     }
 
     // Try to connect. If no server, spawn one.
@@ -50,6 +55,17 @@ fn main() -> io::Result<()> {
     }
     eprintln!("error: no server running on {}", socket_path);
     std::process::exit(1);
+}
+
+fn start_server(socket_path: &str) -> io::Result<()> {
+    let config = ServerConfig {
+        socket_path: socket_path.to_string(),
+        socket_mode: 0o600,
+    };
+    let mut server = Server::new(config)?;
+    server.create_socket()?;
+    server.run()?;
+    Ok(())
 }
 
 fn send_msg(peer: &mut Peer, msg: &Message) -> io::Result<()> {
