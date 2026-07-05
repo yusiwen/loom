@@ -225,6 +225,34 @@ Client stdout ◀─────┼──│ IPC send │◀──│ redraw() �
                     └─────────────────────────────────────────┘
 ```
 
+## Testing
+
+### Strategies
+
+Four approaches for testing loom's terminal output, ordered by automation level:
+
+| Approach | Tool | How It Works | CI Ready | Visual |
+|----------|------|--------------|----------|--------|
+| **A. ANSI golden file** | `cmp`, `capture-pane` | Run loom in a PTY, capture ANSI output, compare against expected `.result` files | ✅ Yes | ✅ Text-based |
+| **B. `script` recording** | `script(1)` | Record raw TTY I/O to file, replay with `scriptreplay` | ⚠️ Partial | ✅ Full TTY |
+| **C. `asciinema` cast** | `asciinema` | Record JSON-based terminal session, embed in HTML for web playback | ⚠️ Partial | ✅ Web-ready |
+| **D. `vte2png` rendering** | `vte2png`, `hat` | Render ANSI output to PNG image for visual regression testing | ⚠️ Needs binary | ✅ Image |
+
+### Recommendation
+
+| Use Case | Approach |
+|----------|----------|
+| CI / automated regression | **A** (golden file) — tmux's proven model, 105 reference results in tree |
+| Debugging live output | **B** (`script`) — zero setup, built into every Unix |
+| Demo / documentation | **C** (`asciinema`) — shareable web player |
+| Visual diff testing | **D** (vte2png) — optional, when pixel-perfect rendering matters |
+
+### Current Status
+
+- **22 unit/integration tests** cover command execution, IPC protocol, format expansion, and queue logic
+- **Golden file approach** not yet implemented — requires a PTY harness to run loom and capture pane output
+- **Next step:** implement a `loom capture-pane -p` equivalent in the test harness, build golden file comparison
+
 ## Notes
 
 - Phase dependencies are strict: each phase builds on the previous.
