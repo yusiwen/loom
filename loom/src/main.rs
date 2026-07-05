@@ -9,7 +9,6 @@ use nix::sys::termios;
 
 use loom_ipc::message::Message;
 use loom_ipc::peer::Peer;
-use loom_server::server::{Server, ServerConfig};
 
 const STDIN_TOKEN: Token = Token(0);
 const PEER_TOKEN: Token = Token(1);
@@ -29,41 +28,28 @@ fn main() -> io::Result<()> {
         let _ = std::fs::create_dir_all(parent);
     }
 
-    if args.get(1).map(|s| s.as_str()) == Some("start-server") {
-        return start_server(&socket_path);
-    }
-
-    match connect_and_run(&socket_path, &args[1..]) {
-        Ok(_) => {}
-        Err(e) if e.kind() == io::ErrorKind::ConnectionRefused
-            || e.kind() == io::ErrorKind::NotFound =>
-        {
-            match unsafe { nix::libc::fork() } {
-                -1 => return Err(io::Error::last_os_error()),
-                0 => { return start_server(&socket_path); }
-                pid => {
-                    let _ = nix::sys::wait::waitpid(
-                        nix::unistd::Pid::from_raw(pid),
-                        None,
-                    );
-                    connect_and_run(&socket_path, &args[1..])?;
+    // Try to connect. If no server, spawn one.
+    for attempt in 0..60 {
+        match connect_and_run(&socket_path, &args[1..]) {
+            Ok(()) => return Ok(()),
+            Err(e) if e.kind() == io::ErrorKind::ConnectionRefused
+                || e.kind() == io::ErrorKind::NotFound =>
+            {
+                if attempt == 0 {
+                    // Spawn server as a subprocess on first failure
+                    if let Ok(exe) = std::env::current_exe() {
+                        let _ = std::process::Command::new(&exe)
+                            .arg("start-server")
+                            .spawn();
+                    }
                 }
+                std::thread::sleep(Duration::from_millis(200));
             }
+            Err(e) => return Err(e),
         }
-        Err(e) => return Err(e),
     }
-    Ok(())
-}
-
-fn start_server(socket_path: &str) -> io::Result<()> {
-    let config = ServerConfig {
-        socket_path: socket_path.to_string(),
-        socket_mode: 0o600,
-    };
-    let mut server = Server::new(config)?;
-    server.create_socket()?;
-    server.run()?;
-    Ok(())
+    eprintln!("error: no server running on {}", socket_path);
+    std::process::exit(1);
 }
 
 fn send_msg(peer: &mut Peer, msg: &Message) -> io::Result<()> {
@@ -125,16 +111,22 @@ fn connect_and_run(socket_path: &str, cmd_args: &[String]) -> io::Result<()> {
             .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("flush: {}", e)))?;
         run_attached(&mut peer)
     } else {
-        loop {
+        // Read responses; break on first meaningful response or Exit
+        for _ in 0..100 {
             match peer.recv()
                 .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("recv: {}", e)))?
             {
                 Some(Message::Exit) => break,
                 Some(Message::Command { argv, .. }) => {
-                    if argv.len() >= 2 && argv[0] == ";" { print!("{}", argv[1]); }
+                    if argv.len() >= 2 && argv[0] == ";" {
+                        print!("{}", argv[1]);
+                        let _ = io::stdout().flush();
+                        break;
+                    }
                 }
-                Some(_) => {}
-                None => { std::thread::sleep(Duration::from_millis(10)); }
+                Some(Message::Ready) => {}
+                Some(_) => break,
+                None => { std::thread::sleep(Duration::from_millis(20)); }
             }
         }
         Ok(())
