@@ -495,13 +495,13 @@ impl Server {
                             let mut session = Session::new(None, &cwd);
                             let mut window = Window::new(80, 24);
                             let wid = window.id;
+                            let sid = session.id;
 
-                            // Create pane with shell
+                            // Insert window first so spawn_pane can find it
+                            self.windows.insert(wid, window);
                             let _pane_id = self.spawn_pane(wid, 80, 24, &cwd);
 
                             session.attach_window(0, wid);
-                            let sid = session.id;
-                            self.windows.insert(wid, window);
                             self.sessions.insert(sid, session);
 
                             if let Some(client) = self.clients.get_mut(&token) {
