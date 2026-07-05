@@ -114,13 +114,22 @@ fn connect_and_run(socket_path: &str, cmd_args: &[String]) -> io::Result<()> {
     send_msg(&mut peer, &Message::IdentifyTtyName(String::new()))?;
     send_msg(&mut peer, &Message::IdentifyCwd(cwd))?;
     send_msg(&mut peer, &Message::IdentifyClientPid(std::process::id()))?;
-    send_msg(&mut peer, &Message::IdentifyEnviron(std::env::vars().collect()))?;
+    send_msg(&mut peer, &Message::IdentifyEnviron(std::env::vars()
+        .filter(|(k, _)| {
+            matches!(k.as_str(),
+                "TERM" | "SHELL" | "HOME" | "USER" | "PATH" | "LANG"
+                | "LC_ALL" | "LC_CTYPE" | "EDITOR" | "PAGER" | "DISPLAY"
+                | "SSH_AUTH_SOCK" | "SSH_CONNECTION" | "SSH_CLIENT"
+                | "TMUX" | "TMUX_PANE")
+        })
+        .collect()))?;
     send_msg(&mut peer, &Message::IdentifyDone)?;
     peer.flush()
         .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("flush: {}", e)))?;
     loom_core::log_debug!(log, "identify", "identify sent, waiting for Ready");
 
     loop {
+        let _ = peer.flush();
         match peer.recv()
             .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("recv: {}", e)))?
         {
@@ -162,6 +171,7 @@ fn connect_and_run(socket_path: &str, cmd_args: &[String]) -> io::Result<()> {
         run_attached(&mut peer, log)
     } else {
         for _ in 0..100 {
+            let _ = peer.flush();
             match peer.recv()
                 .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("recv: {}", e)))?
             {
