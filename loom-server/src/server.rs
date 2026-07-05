@@ -224,6 +224,30 @@ impl Server {
         Some(pid)
     }
 
+    /// Add a pre-established client stream (for testing).
+    pub fn add_client_stream(&mut self, std_stream: std::os::unix::net::UnixStream) -> io::Result<Token> {
+        std_stream.set_nonblocking(true)?;
+        let stream = mio::net::UnixStream::from_std(std_stream);
+        let peer = Peer::new(stream);
+        let token = Token(CLIENT_BASE + self.next_client_token);
+        self.next_client_token += 1;
+
+        let client = ClientState {
+            peer,
+            flags: 0,
+            session_id: None,
+            identified: false,
+            term_name: String::new(),
+            tty_name: String::new(),
+            cwd: String::new(),
+            pid: 0,
+            attached: false,
+        };
+
+        self.clients.insert(token, client);
+        Ok(token)
+    }
+
     fn handle_accept(&mut self) -> io::Result<()> {
         let fd = match self.listen_fd {
             Some(fd) => fd,

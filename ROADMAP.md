@@ -18,7 +18,7 @@ Target: ~60,000–80,000 lines of Rust, organized as a Cargo workspace.
 | 4 | `loom-input` (VT100 state machine, CSI/ESC dispatch) | ✅ | 5 |
 | 5 | `loom-server` + `loom` binary (session/window/pane, socket, dispatch, PTY spawn, client, redraw, layout split) | ✅ | 28 |
 | 6 | `loom-commands` + `loom-config` (21 commands, queue, format, config parser) | ✅ | 13 |
-| 7 | Interactive I/O loop (raw mode, PTY I/O, ScreenUpdate, attach) | 🔄 | — |
+| 7 | Interactive I/O loop + integration tests (raw mode, PTY I/O, ScreenUpdate, attach) | 🔄 | 5 |
 
 **Total:** ~5,900 lines of Rust across 6 crates + 1 binary. (Target: ~7,000+ after Phase 7.)
 
@@ -154,7 +154,7 @@ Target: ~60,000–80,000 lines of Rust, organized as a Cargo workspace.
 | Key binding tables | — | 📋 Pending |
 | Status line, prompts, menus, popups | — | 📋 Pending |
 
-**Tests:** 13 passing.
+**Tests:** 23 passing (unit + integration).
 
 **Key C sources translated:** `cmd.c` (command table), `cmd-new-session.c`, `cmd-new-window.c`, `cmd-kill-session.c`, `cmd-list-sessions.c`, `cmd-split-window.c`, `cmd-select-pane.c`, `cmd-send-keys.c`, `cmd-resize-pane.c`, `cmd-kill-pane.c`, `cmd-swap-pane.c`, `cmd-switch-client.c`, `cmd-attach-session.c`, `cmd-detach-client.c`, `cmd-set-option.c`, `cmd-list-windows.c`, `cmd-list-panes.c`, `arguments.c` (basic), `cmd-parse.y` (basic nom replacement).
 
