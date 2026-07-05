@@ -44,6 +44,7 @@ impl Logger {
             .as_secs();
         let mut f = self.file.lock().unwrap();
         let _ = writeln!(f, "[{}] [{}] [{}] {}", now, level, target, msg);
+        let _ = f.flush();
     }
 }
 
