@@ -203,7 +203,72 @@ impl Server {
                     self.handle_client_event(token, event)?;
                 }
             }
+
+            // Poll PTY fds directly (workaround for mio SourceFd signal fd issue)
+            self.poll_ptys()?;
         }
+        Ok(())
+    }
+
+    fn poll_ptys(&mut self) -> io::Result<()> {
+        let snapshot: Vec<(RawFd, Token, PaneId)> = self.attached_panes.iter()
+            .map(|(&fd, &(token, pid))| (fd, token, pid))
+            .collect();
+
+        for (fd, client_token, pane_id) in snapshot {
+            if !self.attached_panes.contains_key(&fd) {
+                continue; // was cleaned up during iteration
+            }
+            if !self.clients.contains_key(&client_token) {
+                self.cleanup_pty(fd);
+                continue;
+            }
+
+            let mut buf = [0u8; 65536];
+            match nix::unistd::read(fd, &mut buf) {
+                Ok(0) => {
+                    let _ = self.send_to(client_token, &Message::Exited);
+                    self.cleanup_pty(fd);
+                }
+                Ok(n) => {
+                    let data = &buf[..n];
+                    self.process_pty_data(fd, client_token, pane_id, data)?;
+                }
+                Err(nix::errno::Errno::EAGAIN) | Err(nix::errno::Errno::EINTR) => {}
+                Err(e) => {
+                    self.cleanup_pty(fd);
+                    return Err(io::Error::new(io::ErrorKind::Other, format!("pty poll: {}", e)));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn process_pty_data(&mut self, fd: RawFd, client_token: Token, pane_id: PaneId, data: &[u8]) -> io::Result<()> {
+        // Find window for this pane
+        let wid = match self.windows.iter()
+            .find(|(_, w)| w.panes.contains_key(&pane_id))
+            .map(|(&id, _)| id)
+        {
+            Some(wid) => wid,
+            None => return Ok(()),
+        };
+
+        if let Some(window) = self.windows.get_mut(&wid) {
+            if let Some(pane) = window.panes.get_mut(&pane_id) {
+                let mut ctx = InputCtx::new(&mut pane.screen);
+                ctx.parse_buf(data);
+            }
+        }
+
+        // Redraw and send update
+        if let Some(window) = self.windows.get(&wid) {
+            let mut redraw_buf = Vec::new();
+            if redraw::redraw_window(window, &mut redraw_buf).is_ok() {
+                let _ = self.send_to(client_token, &Message::ScreenUpdate { data: redraw_buf });
+            }
+        }
+
         Ok(())
     }
 
