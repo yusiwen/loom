@@ -217,9 +217,10 @@ impl Server {
 
         for (fd, client_token, pane_id) in snapshot {
             if !self.attached_panes.contains_key(&fd) {
-                continue; // was cleaned up during iteration
+                continue;
             }
             if !self.clients.contains_key(&client_token) {
+                loom_core::log_debug!(self.log, "pty_poll", "client gone, cleanup fd={}", fd);
                 self.cleanup_pty(fd);
                 continue;
             }
@@ -227,45 +228,55 @@ impl Server {
             let mut buf = [0u8; 65536];
             match nix::unistd::read(fd, &mut buf) {
                 Ok(0) => {
+                    loom_core::log_debug!(self.log, "pty_poll", "EOF on fd={}", fd);
                     let _ = self.send_to(client_token, &Message::Exited);
                     self.cleanup_pty(fd);
                 }
                 Ok(n) => {
-                    let data = &buf[..n];
-                    self.process_pty_data(fd, client_token, pane_id, data)?;
+                    loom_core::log_debug!(self.log, "pty_poll", "read {} bytes from fd={}", n, fd);
+                    self.process_pty_data(client_token, pane_id, &buf[..n])?;
                 }
-                Err(nix::errno::Errno::EAGAIN) | Err(nix::errno::Errno::EINTR) => {}
+                Err(nix::errno::Errno::EAGAIN) => {
+                    loom_core::log_debug!(self.log, "pty_poll", "EAGAIN on fd={}", fd);
+                }
+                Err(nix::errno::Errno::EINTR) => {}
                 Err(e) => {
+                    loom_core::log_error!(self.log, "pty_poll", "read error on fd={}: {}", fd, e);
                     self.cleanup_pty(fd);
-                    return Err(io::Error::new(io::ErrorKind::Other, format!("pty poll: {}", e)));
                 }
             }
         }
         Ok(())
     }
 
-    fn process_pty_data(&mut self, fd: RawFd, client_token: Token, pane_id: PaneId, data: &[u8]) -> io::Result<()> {
-        // Find window for this pane
+    fn process_pty_data(&mut self, client_token: Token, pane_id: PaneId, data: &[u8]) -> io::Result<()> {
+        loom_core::log_debug!(self.log, "pty_data", "processing {} bytes for pane={}", data.len(), pane_id);
         let wid = match self.windows.iter()
             .find(|(_, w)| w.panes.contains_key(&pane_id))
             .map(|(&id, _)| id)
         {
             Some(wid) => wid,
-            None => return Ok(()),
+            None => {
+                loom_core::log_debug!(self.log, "pty_data", "no window for pane={}", pane_id);
+                return Ok(());
+            }
         };
 
         if let Some(window) = self.windows.get_mut(&wid) {
             if let Some(pane) = window.panes.get_mut(&pane_id) {
+                loom_core::log_debug!(self.log, "pty_data", "parsing {} bytes through InputCtx", data.len());
                 let mut ctx = InputCtx::new(&mut pane.screen);
                 ctx.parse_buf(data);
             }
         }
 
-        // Redraw and send update
         if let Some(window) = self.windows.get(&wid) {
             let mut redraw_buf = Vec::new();
             if redraw::redraw_window(window, &mut redraw_buf).is_ok() {
+                loom_core::log_debug!(self.log, "pty_data", "sending ScreenUpdate ({} bytes)", redraw_buf.len());
                 let _ = self.send_to(client_token, &Message::ScreenUpdate { data: redraw_buf });
+            } else {
+                loom_core::log_error!(self.log, "pty_data", "redraw failed");
             }
         }
 
@@ -640,6 +651,12 @@ impl Server {
                                         if let Some(pane) = window.panes.get(&active_pane_id) {
                                             if let Some(pfd) = pane.fd {
                                                 loom_core::log_debug!(self.log, "dispatch", "attaching PTY fd={}", pfd);
+                                                // Set PTY fd to non-blocking for poll_ptys
+                                                let flags = nix::fcntl::fcntl(pfd, nix::fcntl::FcntlArg::F_GETFL)
+                                                    .unwrap_or(0);
+                                                let _ = nix::fcntl::fcntl(pfd, nix::fcntl::FcntlArg::F_SETFL(
+                                                    nix::fcntl::OFlag::from_bits_truncate(flags | nix::libc::O_NONBLOCK as i32)
+                                                ));
                                                 let pty_token = Token(PTY_BASE + self.next_pty_token);
                                                 self.next_pty_token += 1;
                                                 let mut source = SourceFd(&pfd);
