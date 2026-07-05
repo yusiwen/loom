@@ -7,6 +7,7 @@ use mio::net::UnixStream;
 use mio::{event::Event, Events, Interest, Poll, Registry, Token, Waker};
 use mio::unix::SourceFd;
 
+use loom_core::log::Logger;
 use loom_core::session::{PaneId, Session, SessionId, Window, WindowId};
 use loom_ipc::message::Message;
 use loom_ipc::peer::Peer;
@@ -64,6 +65,7 @@ pub struct Server {
     poll: Poll,
     #[allow(dead_code)]
     waker: Waker,
+    log: Option<Logger>,
     clients: HashMap<Token, ClientState>,
     next_client_token: usize,
     sessions: HashMap<SessionId, Session>,
@@ -77,12 +79,16 @@ pub struct Server {
 
 impl Server {
     pub fn new(config: ServerConfig) -> io::Result<Self> {
+        loom_core::log::init();
         let poll = Poll::new()?;
         let waker = Waker::new(poll.registry(), WAKER_TOKEN)?;
+        let log = Logger::new("server");
+        loom_core::log_info!(log, "start", "server created, socket={}", config.socket_path);
         Ok(Self {
             config,
             poll,
             waker,
+            log,
             clients: HashMap::new(),
             next_client_token: 0,
             sessions: HashMap::new(),
@@ -205,11 +211,13 @@ impl Server {
     fn spawn_pane(&mut self, wid: WindowId, sx: u32, sy: u32, cwd: &str) -> Option<PaneId> {
         let window = self.windows.get_mut(&wid)?;
         let pid = window.create_pane(sx, sy);
+        loom_core::log_debug!(self.log, "spawn", "pane_id={}, wid={}, cwd={}", pid, wid, cwd);
 
-        // Try to spawn a shell in the pane
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+        loom_core::log_debug!(self.log, "spawn", "calling spawn_pty(shell={}, cwd={})", shell, cwd);
         match spawner::spawn_pty(&[shell.clone()], cwd, sx, sy) {
             Ok((child_pid, master_fd)) => {
+                loom_core::log_info!(self.log, "spawn", "spawn_pty ok: pid={}, fd={}", child_pid, master_fd);
                 if let Some(pane) = window.panes.get_mut(&pid) {
                     pane.fd = Some(master_fd);
                     pane.pid = Some(child_pid.as_raw() as u32);
@@ -218,7 +226,7 @@ impl Server {
                 }
             }
             Err(e) => {
-                eprintln!("spawn_pty failed: {}", e);
+                loom_core::log_error!(self.log, "spawn", "spawn_pty FAILED: {}", e);
             }
         }
         Some(pid)
@@ -249,6 +257,7 @@ impl Server {
     }
 
     fn handle_accept(&mut self) -> io::Result<()> {
+        loom_core::log_debug!(self.log, "accept", "handling accept");
         let fd = match self.listen_fd {
             Some(fd) => fd,
             None => return Ok(()),
@@ -300,6 +309,7 @@ impl Server {
             )?;
 
             self.clients.insert(token, client);
+            loom_core::log_debug!(self.log, "accept", "accepted client token={:?}", token);
         }
 
         Ok(())
@@ -326,7 +336,7 @@ impl Server {
             let mut buf = vec![0u8; 65536];
             match nix::unistd::read(fd, &mut buf) {
                 Ok(0) => {
-                    // PTY closed (child exited)
+                    loom_core::log_debug!(self.log, "pty", "EOF on fd={}", fd);
                     let notify_client = self.attached_panes.get(&fd).map(|&(ct, _)| ct);
                     self.cleanup_pty(fd);
                     if let Some(ct) = notify_client {
@@ -336,6 +346,7 @@ impl Server {
                 }
                 Ok(n) => {
                     buf.truncate(n);
+                    loom_core::log_debug!(self.log, "pty", "read {} bytes from fd={}", n, fd);
 
                     let (client_token, pane_id) = match self.attached_panes.get(&fd) {
                         Some(&(ct, pid)) => (ct, pid),
@@ -376,8 +387,8 @@ impl Server {
                 }
                 Err(nix::errno::Errno::EAGAIN) => {}
                 Err(e) => {
+                    loom_core::log_error!(self.log, "pty", "read error on fd={}: {}", fd, e);
                     self.cleanup_pty(fd);
-                    eprintln!("pty read error: {}", e);
                 }
             }
         }
@@ -428,6 +439,7 @@ impl Server {
     }
 
     fn dispatch_message(&mut self, token: Token, msg: Message) -> io::Result<()> {
+        loom_core::log_debug!(self.log, "dispatch", "got msg from token={:?}", token);
         match msg {
             Message::IdentifyFlags(flags) => {
                 if let Some(client) = self.clients.get_mut(&token) {
@@ -460,16 +472,19 @@ impl Server {
                 }
             }
             Message::IdentifyDone => {
+                loom_core::log_debug!(self.log, "dispatch", "IdentifyDone from token={:?}", token);
                 if let Some(client) = self.clients.get_mut(&token) {
                     client.identified = true;
                 }
+                loom_core::log_debug!(self.log, "dispatch", "sending Ready");
                 self.send_to(token, &Message::Ready)?;
             }
             Message::Command { argc: _, argv } => {
-                // Execute the command (basic stub - will be expanded with cmd system)
+                loom_core::log_info!(self.log, "dispatch", "Command: {:?}", argv);
                 if argv.len() >= 1 {
                     match argv[0].as_str() {
                         "new-session" | "new" => {
+                            loom_core::log_info!(self.log, "dispatch", "creating new session");
                             let cwd = self.clients.get(&token)
                                 .map(|c| c.cwd.clone())
                                 .unwrap_or_else(|| "/tmp".to_string());
@@ -546,7 +561,7 @@ impl Server {
                 }
             }
             Message::AttachSession => {
-                // Find the active pane's PTY fd and register it with mio
+                loom_core::log_debug!(self.log, "dispatch", "AttachSession from token={:?}", token);
                 if let Some(client) = self.clients.get(&token) {
                     if let Some(sid) = client.session_id {
                         if let Some(session) = self.sessions.get(&sid) {
@@ -555,7 +570,7 @@ impl Server {
                                     if let Some(active_pane_id) = window.active_pane_id {
                                         if let Some(pane) = window.panes.get(&active_pane_id) {
                                             if let Some(pfd) = pane.fd {
-                                                // Register PTY fd with event loop
+                                                loom_core::log_debug!(self.log, "dispatch", "attaching PTY fd={}", pfd);
                                                 let pty_token = Token(PTY_BASE + self.next_pty_token);
                                                 self.next_pty_token += 1;
                                                 let mut source = SourceFd(&pfd);
@@ -565,7 +580,12 @@ impl Server {
                                                     Interest::READABLE,
                                                 ).is_ok() {
                                                     self.attached_panes.insert(pfd, (token, active_pane_id));
+                                                    loom_core::log_info!(self.log, "dispatch", "PTY registered token={:?}", pty_token);
+                                                } else {
+                                                    loom_core::log_error!(self.log, "dispatch", "failed to register PTY fd");
                                                 }
+                                            } else {
+                                                loom_core::log_error!(self.log, "dispatch", "AttachSession: pane.fd is None (spawn failed?)");
                                             }
                                         }
                                     }
@@ -580,7 +600,7 @@ impl Server {
                 }
             }
             Message::KeyPress { key } => {
-                // Forward keystrokes to the pane's PTY
+                loom_core::log_debug!(self.log, "dispatch", "KeyPress ({} bytes)", key.len());
                 if let Some(client) = self.clients.get(&token) {
                     if let Some(sid) = client.session_id {
                         if let Some(session) = self.sessions.get(&sid) {

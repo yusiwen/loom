@@ -1,5 +1,6 @@
 pub mod colour;
 pub mod grid_cell;
+pub mod log;
 pub mod options;
 pub mod screen;
 pub mod session;

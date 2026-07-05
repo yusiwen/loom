@@ -7,6 +7,7 @@ use mio::{Events, Interest, Poll, Token};
 use mio::unix::SourceFd;
 use nix::sys::termios;
 
+use loom_core::log::{Logger, self as log_core};
 use loom_ipc::message::Message;
 use loom_ipc::peer::Peer;
 use loom_server::server::{Server, ServerConfig};
@@ -22,26 +23,33 @@ fn default_socket_path() -> String {
 }
 
 fn main() -> io::Result<()> {
+    log_core::init();
+    let log = Logger::new("client");
+
     let args: Vec<String> = std::env::args().collect();
     let socket_path = default_socket_path();
+
+    loom_core::log_info!(log, "main", "starting loom, args={:?}", args);
+    loom_core::log_debug!(log, "main", "socket_path={}", socket_path);
 
     if let Some(parent) = std::path::Path::new(&socket_path).parent() {
         let _ = std::fs::create_dir_all(parent);
     }
 
     if args.get(1).map(|s| s.as_str()) == Some("start-server") {
+        loom_core::log_info!(log, "main", "running as server");
         return start_server(&socket_path);
     }
 
-    // Try to connect. If no server, spawn one.
     for attempt in 0..60 {
         match connect_and_run(&socket_path, &args[1..]) {
             Ok(()) => return Ok(()),
             Err(e) if e.kind() == io::ErrorKind::ConnectionRefused
                 || e.kind() == io::ErrorKind::NotFound =>
             {
+                loom_core::log_debug!(log, "connect", "attempt {} failed: {:?}", attempt, e.kind());
                 if attempt == 0 {
-                    // Spawn server as a subprocess on first failure
+                    loom_core::log_info!(log, "connect", "no server running, spawning one");
                     if let Ok(exe) = std::env::current_exe() {
                         let _ = std::process::Command::new(&exe)
                             .arg("start-server")
@@ -50,9 +58,13 @@ fn main() -> io::Result<()> {
                 }
                 std::thread::sleep(Duration::from_millis(200));
             }
-            Err(e) => return Err(e),
+            Err(e) => {
+                loom_core::log_error!(log, "connect", "unexpected error: {}", e);
+                return Err(e);
+            }
         }
     }
+    loom_core::log_error!(log, "connect", "server not available after 60 retries");
     eprintln!("error: no server running on {}", socket_path);
     std::process::exit(1);
 }
@@ -75,7 +87,17 @@ fn send_msg(peer: &mut Peer, msg: &Message) -> io::Result<()> {
 }
 
 fn connect_and_run(socket_path: &str, cmd_args: &[String]) -> io::Result<()> {
-    let std_stream = StdUnixStream::connect(socket_path)?;
+    let log = Logger::new("client");
+
+    loom_core::log_debug!(log, "connect", "connecting to {}", socket_path);
+    let std_stream = match StdUnixStream::connect(socket_path) {
+        Ok(s) => { loom_core::log_debug!(log, "connect", "connected successfully"); s }
+        Err(e) => {
+            loom_core::log_debug!(log, "connect", "connect failed: {}", e);
+            return Err(e);
+        }
+    };
+
     std_stream.set_nonblocking(true)?;
     let stream = mio::net::UnixStream::from_std(std_stream);
     let mut peer = Peer::new(stream);
@@ -85,6 +107,7 @@ fn connect_and_run(socket_path: &str, cmd_args: &[String]) -> io::Result<()> {
         .unwrap_or_else(|_| "/".to_string());
     let term = std::env::var("TERM").unwrap_or_else(|_| "xterm-256color".to_string());
 
+    loom_core::log_debug!(log, "identify", "sending identify ({}, cwd={})", term, cwd);
     send_msg(&mut peer, &Message::IdentifyFlags(0))?;
     send_msg(&mut peer, &Message::IdentifyLongFlags(0))?;
     send_msg(&mut peer, &Message::IdentifyTerm(term))?;
@@ -95,23 +118,32 @@ fn connect_and_run(socket_path: &str, cmd_args: &[String]) -> io::Result<()> {
     send_msg(&mut peer, &Message::IdentifyDone)?;
     peer.flush()
         .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("flush: {}", e)))?;
+    loom_core::log_debug!(log, "identify", "identify sent, waiting for Ready");
 
     loop {
         match peer.recv()
             .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("recv: {}", e)))?
         {
-            Some(Message::Ready) => break,
-            Some(_) => continue,
+            Some(Message::Ready) => {
+                loom_core::log_debug!(log, "identify", "got Ready");
+                break;
+            }
+            Some(m) => {
+                loom_core::log_debug!(log, "identify", "got unexpected message: {:?}", m);
+                continue;
+            }
             None => { std::thread::sleep(Duration::from_millis(10)); continue; }
         }
     }
 
     let is_attach = if cmd_args.is_empty() || cmd_args[0] == "attach" || cmd_args[0] == "attach-session" {
+        loom_core::log_info!(log, "cmd", "auto: new-session (attach)");
         send_msg(&mut peer, &Message::Command {
             argc: 1, argv: vec!["new-session".into()],
         })?;
         true
     } else {
+        loom_core::log_info!(log, "cmd", "forwarding: {:?}", cmd_args);
         send_msg(&mut peer, &Message::Command {
             argc: cmd_args.len() as u32,
             argv: cmd_args.to_vec(),
@@ -122,26 +154,33 @@ fn connect_and_run(socket_path: &str, cmd_args: &[String]) -> io::Result<()> {
         .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("flush: {}", e)))?;
 
     if is_attach {
+        loom_core::log_debug!(log, "attach", "sending AttachSession");
         send_msg(&mut peer, &Message::AttachSession)?;
         peer.flush()
             .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("flush: {}", e)))?;
-        run_attached(&mut peer)
+        loom_core::log_info!(log, "attach", "entering attach mode");
+        run_attached(&mut peer, log)
     } else {
-        // Read responses; break on first meaningful response or Exit
         for _ in 0..100 {
             match peer.recv()
                 .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("recv: {}", e)))?
             {
-                Some(Message::Exit) => break,
+                Some(Message::Exit) => {
+                    loom_core::log_debug!(log, "response", "got Exit");
+                    break;
+                }
                 Some(Message::Command { argv, .. }) => {
                     if argv.len() >= 2 && argv[0] == ";" {
+                        loom_core::log_debug!(log, "response", "got response: {}", argv[1]);
                         print!("{}", argv[1]);
                         let _ = io::stdout().flush();
                         break;
                     }
                 }
-                Some(Message::Ready) => {}
-                Some(_) => break,
+                Some(m) => {
+                    loom_core::log_debug!(log, "response", "got unexpected: {:?}", m);
+                    break;
+                }
                 None => { std::thread::sleep(Duration::from_millis(20)); }
             }
         }
@@ -160,9 +199,10 @@ fn get_terminal_size() -> (u32, u32) {
     (ws.ws_col as u32, ws.ws_row as u32)
 }
 
-fn run_attached(peer: &mut Peer) -> io::Result<()> {
+fn run_attached(peer: &mut Peer, log: Option<Logger>) -> io::Result<()> {
     let bfd = |fd: i32| unsafe { BorrowedFd::borrow_raw(fd) };
 
+    loom_core::log_debug!(log, "attach", "setting raw mode");
     let orig_tio = termios::tcgetattr(bfd(0))
         .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("tcgetattr: {}", e)))?;
 
@@ -199,29 +239,27 @@ fn run_attached(peer: &mut Peer) -> io::Result<()> {
 
     peer.register(poll.registry(), PEER_TOKEN, Interest::READABLE | Interest::WRITABLE)?;
 
-    // Send initial terminal size
     let (sx, sy) = get_terminal_size();
+    loom_core::log_debug!(log, "attach", "initial size: {}x{}", sx, sy);
     let _ = send_msg(peer, &Message::Resize { sx, sy });
     let _ = peer.flush();
 
-    // Write initial clear
     let _ = io::stdout().write_all(b"\x1b[2J\x1b[H");
     let _ = io::stdout().flush();
 
     let mut last_size = (sx, sy);
 
     loop {
-        // Poll for events with a short timeout to check terminal size
         match poll.poll(&mut events, Some(Duration::from_millis(200))) {
             Ok(_) => {}
             Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
             Err(e) => return Err(e),
         }
 
-        // Check for terminal resize periodically
         let current_size = get_terminal_size();
         if current_size != last_size {
             last_size = current_size;
+            loom_core::log_debug!(log, "resize", "new size: {}x{}", current_size.0, current_size.1);
             let _ = send_msg(peer, &Message::Resize {
                 sx: current_size.0,
                 sy: current_size.1,
@@ -234,11 +272,14 @@ fn run_attached(peer: &mut Peer) -> io::Result<()> {
                 STDIN_TOKEN => {
                     let mut buf = [0u8; 256];
                     match nix::unistd::read(0, &mut buf) {
-                        Ok(0) => return Ok(()),
+                        Ok(0) => {
+                            loom_core::log_debug!(log, "stdin", "EOF");
+                            return Ok(());
+                        }
                         Ok(n) => {
                             let keys = buf[..n].to_vec();
-                            // Ctrl-C (0x03) or Ctrl-D (0x04) exits attach mode
                             if keys == [0x03] || keys == [0x04] {
+                                loom_core::log_debug!(log, "stdin", "Ctrl-C/D, detaching");
                                 let _ = send_msg(peer, &Message::Detach);
                                 let _ = peer.flush();
                                 return Ok(());
@@ -247,11 +288,15 @@ fn run_attached(peer: &mut Peer) -> io::Result<()> {
                             let _ = peer.flush();
                         }
                         Err(nix::errno::Errno::EAGAIN) => {}
-                        Err(_) => return Ok(()),
+                        Err(e) => {
+                            loom_core::log_error!(log, "stdin", "read error: {}", e);
+                            return Ok(());
+                        }
                     }
                 }
                 PEER_TOKEN => {
                     if event.is_error() || event.is_read_closed() || event.is_write_closed() {
+                        loom_core::log_debug!(log, "peer", "connection closed");
                         return Ok(());
                     }
                     if event.is_readable() {
@@ -259,11 +304,17 @@ fn run_attached(peer: &mut Peer) -> io::Result<()> {
                             .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("recv: {}", e)))?
                         {
                             Some(Message::ScreenUpdate { data }) => {
+                                loom_core::log_debug!(log, "screen", "got ScreenUpdate ({} bytes)", data.len());
                                 let _ = io::stdout().write_all(&data);
                                 let _ = io::stdout().flush();
                             }
-                            Some(Message::Exit) | Some(Message::Exited) => return Ok(()),
-                            Some(_) => {}
+                            Some(Message::Exit) | Some(Message::Exited) => {
+                                loom_core::log_debug!(log, "peer", "got Exit/Exited");
+                                return Ok(());
+                            }
+                            Some(m) => {
+                                loom_core::log_debug!(log, "peer", "unexpected msg: {:?}", m);
+                            }
                             None => {}
                         }
                     }
