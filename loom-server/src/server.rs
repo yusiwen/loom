@@ -414,16 +414,20 @@ impl Server {
         }
 
         if event.is_readable() {
-            let msg = {
-                let client = match self.clients.get_mut(&token) {
-                    Some(c) => c,
-                    None => return Ok(()),
+            loop {
+                let msg = {
+                    let client = match self.clients.get_mut(&token) {
+                        Some(c) => c,
+                        None => return Ok(()),
+                    };
+                    client.peer.recv()?
                 };
-                client.peer.recv()?
-            };
-
-            if let Some(msg) = msg {
-                self.dispatch_message(token, msg)?;
+                match msg {
+                    Some(msg) => {
+                        self.dispatch_message(token, msg)?;
+                    }
+                    None => break,
+                }
             }
         }
 

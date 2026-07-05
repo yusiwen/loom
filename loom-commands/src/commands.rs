@@ -207,19 +207,19 @@ impl Cmd for SplitWindow {
         let sid = match ctx.session_id { Some(s) => s, None => return CmdRetval::Error };
         let vertical = !args.has('h');
         let wid = match current_window_id(&ctx.sessions, sid) { Some(w) => w, None => return CmdRetval::Error };
-        let pid = {
-            if let Some(t) = args.get('t') {
-                find_pane(&ctx.sessions, &ctx.windows, sid, t)
-                    .unwrap_or_else(|| active_pane_id(&ctx.sessions, &ctx.windows, sid).unwrap_or(0))
-            } else {
-                active_pane_id(&ctx.sessions, &ctx.windows, sid).unwrap_or(0)
-            }
+        eprintln!("DBG: sid={}, wid={}", sid, wid);
+        let pid_opt = if let Some(t) = args.get('t') {
+            find_pane(&ctx.sessions, &ctx.windows, sid, t)
+                .or_else(|| active_pane_id(&ctx.sessions, &ctx.windows, sid))
+        } else {
+            active_pane_id(&ctx.sessions, &ctx.windows, sid)
         };
-        if pid == 0 { return CmdRetval::Error; }
+        let pid = match pid_opt {
+            Some(p) => p,
+            None => return CmdRetval::Error,
+        };
         if let Some(window) = ctx.windows.get_mut(&wid) {
-            if let Some(id) = layout::layout_split_pane(window, pid, vertical) {
-                println!("Created pane %{}", id);
-            }
+            layout::layout_split_pane(window, pid, vertical);
         }
         CmdRetval::Normal
     }
@@ -313,9 +313,11 @@ impl Cmd for ResizePane {
         let amount = args.positional.first().and_then(|s| s.parse::<i32>().ok()).unwrap_or(1) as u32;
         let sid = match ctx.session_id { Some(s) => s, None => return CmdRetval::Error };
         let wid = match current_window_id(&ctx.sessions, sid) { Some(w) => w, None => return CmdRetval::Error };
-        let pid = {
-            args.get('t').and_then(|t| find_pane(&ctx.sessions, &ctx.windows, sid, t))
-                .unwrap_or_else(|| active_pane_id(&ctx.sessions, &ctx.windows, sid).unwrap_or(0))
+        let pid = match args.get('t')
+            .and_then(|t| find_pane(&ctx.sessions, &ctx.windows, sid, t))
+            .or_else(|| active_pane_id(&ctx.sessions, &ctx.windows, sid)) {
+                Some(p) => p,
+                None => return CmdRetval::Error,
         };
         if let Some(window) = ctx.windows.get_mut(&wid) {
             if let Some(pane) = window.panes.get_mut(&pid) {
@@ -344,9 +346,10 @@ impl Cmd for KillPane {
     fn exec(&self, ctx: &mut CmdCtx, args: &Args) -> CmdRetval {
         let sid = match ctx.session_id { Some(s) => s, None => return CmdRetval::Error };
         let wid = match current_window_id(&ctx.sessions, sid) { Some(w) => w, None => return CmdRetval::Error };
-        let pid = {
-            args.get('t').and_then(|t| find_pane(&ctx.sessions, &ctx.windows, sid, t))
-                .unwrap_or_else(|| active_pane_id(&ctx.sessions, &ctx.windows, sid).unwrap_or(0))
+        let pid = match args.get('t').and_then(|t| find_pane(&ctx.sessions, &ctx.windows, sid, t))
+            .or_else(|| active_pane_id(&ctx.sessions, &ctx.windows, sid)) {
+                Some(p) => p,
+                None => return CmdRetval::Error,
         };
         if let Some(window) = ctx.windows.get_mut(&wid) {
             if window.panes.len() > 1 { window.remove_pane(pid); layout::fix_layout_panes(window); }
