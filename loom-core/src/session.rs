@@ -240,7 +240,9 @@ impl Window {
         let cell_idx = self.cells.len();
         pane.layout_cell = Some(cell_idx);
         self.cells.push(cell);
-        self.layout_root = Some(cell_idx);
+        if self.layout_root.is_none() {
+            self.layout_root = Some(cell_idx);
+        }
         self.panes.insert(id, pane);
         self.pane_order.push_back(id);
         if self.active_pane_id.is_none() {

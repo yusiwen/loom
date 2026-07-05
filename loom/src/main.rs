@@ -94,7 +94,6 @@ fn connect_and_run(socket_path: &str, cmd_args: &[String]) -> io::Result<()> {
     peer.flush()
         .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("flush: {}", e)))?;
 
-    // Wait for Ready
     loop {
         match peer.recv()
             .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("recv: {}", e)))?
@@ -105,7 +104,6 @@ fn connect_and_run(socket_path: &str, cmd_args: &[String]) -> io::Result<()> {
         }
     }
 
-    // Send command
     let is_attach = if cmd_args.is_empty() || cmd_args[0] == "attach" || cmd_args[0] == "attach-session" {
         send_msg(&mut peer, &Message::Command {
             argc: 1, argv: vec!["new-session".into()],
@@ -121,14 +119,12 @@ fn connect_and_run(socket_path: &str, cmd_args: &[String]) -> io::Result<()> {
     peer.flush()
         .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("flush: {}", e)))?;
 
-    // Enter attach mode
     if is_attach {
         send_msg(&mut peer, &Message::AttachSession)?;
         peer.flush()
             .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("flush: {}", e)))?;
         run_attached(&mut peer)
     } else {
-        // Read response for non-attach commands
         loop {
             match peer.recv()
                 .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("recv: {}", e)))?
@@ -145,14 +141,23 @@ fn connect_and_run(socket_path: &str, cmd_args: &[String]) -> io::Result<()> {
     }
 }
 
+fn get_terminal_size() -> (u32, u32) {
+    let mut ws = nix::libc::winsize {
+        ws_row: 24,
+        ws_col: 80,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    unsafe { nix::libc::ioctl(0, nix::libc::TIOCGWINSZ, &mut ws); }
+    (ws.ws_col as u32, ws.ws_row as u32)
+}
+
 fn run_attached(peer: &mut Peer) -> io::Result<()> {
     let bfd = |fd: i32| unsafe { BorrowedFd::borrow_raw(fd) };
 
-    // Save original termios
     let orig_tio = termios::tcgetattr(bfd(0))
         .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("tcgetattr: {}", e)))?;
 
-    // Set raw mode (simplified - like cfmakeraw)
     let mut raw = orig_tio.clone();
     raw.input_flags &= !(termios::InputFlags::IXON | termios::InputFlags::ICRNL
         | termios::InputFlags::INLCR | termios::InputFlags::IGNCR
@@ -166,7 +171,6 @@ fn run_attached(peer: &mut Peer) -> io::Result<()> {
     termios::tcsetattr(bfd(0), termios::SetArg::TCSANOW, &raw)
         .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("tcsetattr: {}", e)))?;
 
-    // Ensure raw mode is restored on exit
     struct RawModeGuard(RawFd, termios::Termios);
     impl Drop for RawModeGuard {
         fn drop(&mut self) {
@@ -179,46 +183,63 @@ fn run_attached(peer: &mut Peer) -> io::Result<()> {
     }
     let _guard = RawModeGuard(0, orig_tio);
 
-    // Enter mio event loop
     let mut poll = Poll::new()?;
     let mut events = Events::with_capacity(1024);
 
-    // Register stdin
     let mut stdin_source = SourceFd(&0);
     poll.registry().register(&mut stdin_source, STDIN_TOKEN, Interest::READABLE)?;
 
-    // Register peer stream
     peer.register(poll.registry(), PEER_TOKEN, Interest::READABLE | Interest::WRITABLE)?;
+
+    // Send initial terminal size
+    let (sx, sy) = get_terminal_size();
+    let _ = send_msg(peer, &Message::Resize { sx, sy });
+    let _ = peer.flush();
 
     // Write initial clear
     let _ = io::stdout().write_all(b"\x1b[2J\x1b[H");
     let _ = io::stdout().flush();
 
+    let mut last_size = (sx, sy);
+
     loop {
-        match poll.poll(&mut events, Some(Duration::from_millis(100))) {
+        // Poll for events with a short timeout to check terminal size
+        match poll.poll(&mut events, Some(Duration::from_millis(200))) {
             Ok(_) => {}
             Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
             Err(e) => return Err(e),
         }
 
+        // Check for terminal resize periodically
+        let current_size = get_terminal_size();
+        if current_size != last_size {
+            last_size = current_size;
+            let _ = send_msg(peer, &Message::Resize {
+                sx: current_size.0,
+                sy: current_size.1,
+            });
+            let _ = peer.flush();
+        }
+
         for event in &events {
             match event.token() {
                 STDIN_TOKEN => {
-                    // Read from stdin and send to server as keystrokes
                     let mut buf = [0u8; 256];
                     match nix::unistd::read(0, &mut buf) {
-                        Ok(0) => return Ok(()),  // EOF
+                        Ok(0) => return Ok(()),
                         Ok(n) => {
                             let keys = buf[..n].to_vec();
-                            send_msg(peer, &Message::KeyPress { key: keys })?;
-                            peer.flush()
-                                .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("flush: {}", e)))?;
+                            // Ctrl-C (0x03) or Ctrl-D (0x04) exits attach mode
+                            if keys == [0x03] || keys == [0x04] {
+                                let _ = send_msg(peer, &Message::Detach);
+                                let _ = peer.flush();
+                                return Ok(());
+                            }
+                            let _ = send_msg(peer, &Message::KeyPress { key: keys });
+                            let _ = peer.flush();
                         }
                         Err(nix::errno::Errno::EAGAIN) => {}
-                        Err(e) => {
-                            eprintln!("stdin read error: {}", e);
-                            return Ok(());
-                        }
+                        Err(_) => return Ok(()),
                     }
                 }
                 PEER_TOKEN => {
@@ -240,8 +261,7 @@ fn run_attached(peer: &mut Peer) -> io::Result<()> {
                     }
                     if event.is_writable() {
                         if peer.has_pending_writes() {
-                            peer.flush()
-                                .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("flush: {}", e)))?;
+                            let _ = peer.flush();
                         }
                     }
                 }

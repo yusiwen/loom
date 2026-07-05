@@ -318,7 +318,7 @@ impl Server {
         };
 
         if event.is_error() || event.is_read_closed() {
-            self.attached_panes.remove(&fd);
+            self.cleanup_pty(fd);
             return Ok(());
         }
 
@@ -326,21 +326,28 @@ impl Server {
             let mut buf = vec![0u8; 65536];
             match nix::unistd::read(fd, &mut buf) {
                 Ok(0) => {
-                    // PTY closed
-                    self.attached_panes.remove(&fd);
+                    // PTY closed (child exited)
+                    let notify_client = self.attached_panes.get(&fd).map(|&(ct, _)| ct);
+                    self.cleanup_pty(fd);
+                    if let Some(ct) = notify_client {
+                        let _ = self.send_to(ct, &Message::Exited);
+                    }
                     return Ok(());
                 }
                 Ok(n) => {
                     buf.truncate(n);
 
-                    // Get pane and client
                     let (client_token, pane_id) = match self.attached_panes.get(&fd) {
                         Some(&(ct, pid)) => (ct, pid),
                         None => return Ok(()),
                     };
-                    let client_token = client_token;
 
-                    // Find the window for this pane
+                    // Check if client is still connected
+                    if !self.clients.contains_key(&client_token) {
+                        self.cleanup_pty(fd);
+                        return Ok(());
+                    }
+
                     let wid = self.windows.iter()
                         .find(|(_, w)| w.panes.contains_key(&pane_id))
                         .map(|(&id, _)| id);
@@ -348,39 +355,45 @@ impl Server {
                     if let Some(wid) = wid {
                         if let Some(window) = self.windows.get_mut(&wid) {
                             if let Some(pane) = window.panes.get_mut(&pane_id) {
-                                // Parse input through VT100 emulator
                                 let screen = &mut pane.screen;
                                 let mut ctx = InputCtx::new(screen);
                                 ctx.parse_buf(&buf);
                             }
                         }
 
-                        // Redraw and send update
                         if let Some(window) = self.windows.get(&wid) {
                             let mut redraw_buf = Vec::new();
                             if let Err(e) = redraw::redraw_window(window, &mut redraw_buf) {
                                 eprintln!("redraw error: {}", e);
                             } else {
-                                self.send_to(client_token, &Message::ScreenUpdate {
+                                // Ignore errors - client may have disconnected
+                                let _ = self.send_to(client_token, &Message::ScreenUpdate {
                                     data: redraw_buf,
-                                })?;
+                                });
                             }
                         }
                     }
                 }
                 Err(nix::errno::Errno::EAGAIN) => {}
                 Err(e) => {
-                    self.attached_panes.remove(&fd);
-                    return Err(io::Error::new(io::ErrorKind::Other, format!("pty read: {}", e)));
+                    self.cleanup_pty(fd);
+                    eprintln!("pty read error: {}", e);
                 }
             }
         }
 
-        if event.is_writable() {
-            // PTY write readiness - data should already be written
-        }
-
         Ok(())
+    }
+
+    fn cleanup_pty(&mut self, fd: RawFd) {
+        if let Some(&(_, _)) = self.attached_panes.get(&fd) {
+            // Deregister from event loop
+            let mut source = SourceFd(&fd);
+            let _ = self.poll.registry().deregister(&mut source);
+            // Close PTY fd
+            unsafe { nix::libc::close(fd); }
+            self.attached_panes.remove(&fd);
+        }
     }
 
     fn handle_client_event(&mut self, token: Token, event: &Event) -> io::Result<()> {
