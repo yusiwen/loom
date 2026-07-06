@@ -251,6 +251,25 @@ impl Server {
 
     fn process_pty_data(&mut self, client_token: Token, pane_id: PaneId, data: &[u8]) -> io::Result<()> {
         loom_core::log_debug!(self.log, "pty_data", "processing {} bytes for pane={}", data.len(), pane_id);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.process_pty_data_inner(client_token, pane_id, data)
+        }));
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                loom_core::log_error!(self.log, "pty_data", "error: {} (pane={})", e, pane_id);
+            }
+            Err(panic) => {
+                let msg = if let Some(s) = panic.downcast_ref::<&str>() { s.to_string() }
+                          else if let Some(s) = panic.downcast_ref::<String>() { s.clone() }
+                          else { format!("{:?}", panic) };
+                loom_core::log_error!(self.log, "pty_data", "PANIC: {} (pane={}, bytes={})", msg, pane_id, data.len());
+            }
+        }
+        Ok(())
+    }
+
+    fn process_pty_data_inner(&mut self, client_token: Token, pane_id: PaneId, data: &[u8]) -> io::Result<()> {
         let wid = match self.windows.iter()
             .find(|(_, w)| w.panes.contains_key(&pane_id))
             .map(|(&id, _)| id)
@@ -279,7 +298,6 @@ impl Server {
                 loom_core::log_error!(self.log, "pty_data", "redraw failed");
             }
         }
-
         Ok(())
     }
 
@@ -721,11 +739,16 @@ impl Server {
     }
 
     fn send_to(&mut self, token: Token, msg: &Message) -> io::Result<()> {
-        if let Some(client) = self.clients.get_mut(&token) {
-            client.peer.send(msg)
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("send: {}", e)))?;
-            client.peer.flush()
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("flush: {}", e)))?;
+        let client = match self.clients.get_mut(&token) {
+            Some(c) => c,
+            None => return Ok(()),
+        };
+        if let Err(e) = client.peer.send(msg) {
+            loom_core::log_error!(self.log, "send", "send to token={:?} failed: {}", token, e);
+            return Ok(());
+        }
+        if let Err(e) = client.peer.flush() {
+            loom_core::log_error!(self.log, "send", "flush to token={:?} failed: {}", token, e);
         }
         Ok(())
     }
