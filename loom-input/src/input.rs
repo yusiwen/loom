@@ -196,7 +196,7 @@ impl<'a> InputCtx<'a> {
         for &b in self.param_buf[..self.param_len].iter() {
             match b {
                 b'0'..=b'9' => {
-                    val = val * 10 + (b - b'0') as i32;
+                    val = val.saturating_mul(10).saturating_add((b - b'0') as i32);
                     have_val = true;
                 }
                 b';' => {
@@ -255,12 +255,12 @@ fn handle_c0(ctx: &mut InputCtx, ch: u8) {
         0x07 => {} // BEL - ignore for now
         0x08 => { ctx.screen.cx = ctx.screen.cx.saturating_sub(1); } // BS
         0x09 => { // HT - horizontal tab
-            let tab = (ctx.screen.cx / 8 + 1) * 8;
+            let tab = (ctx.screen.cx / 8 + 1).saturating_mul(8);
             ctx.screen.cx = tab.min(ctx.screen.size_x().saturating_sub(1));
         }
         0x0a | 0x0b | 0x0c => { // LF, VT, FF
             ctx.screen.cx = 0; // implicit carriage return
-            ctx.screen.cy += 1;
+            ctx.screen.cy = ctx.screen.cy.saturating_add(1);
             if ctx.screen.cy >= ctx.screen.size_y() {
                 ctx.screen.cy = ctx.screen.size_y() - 1;
                 ctx.screen.grid.scroll_history();
@@ -282,10 +282,10 @@ fn handle_print(ctx: &mut InputCtx, ch: u8) {
         ..ctx.cell
     };
     ctx.screen.grid.view_set_cell(ctx.screen.cx, ctx.screen.cy, &gc);
-    ctx.screen.cx += 1;
+    ctx.screen.cx = ctx.screen.cx.saturating_add(1);
     if ctx.screen.cx >= ctx.screen.size_x() {
         ctx.screen.cx = 0;
-        ctx.screen.cy += 1;
+        ctx.screen.cy = ctx.screen.cy.saturating_add(1);
         if ctx.screen.cy >= ctx.screen.size_y() {
             ctx.screen.cy = ctx.screen.size_y() - 1;
             ctx.screen.grid.scroll_history();
@@ -400,11 +400,13 @@ fn dispatch_csi_command(ctx: &mut InputCtx, cmd: CsiType) {
         }
         Cud => {
             let n = ctx.param_or(0, 1).max(1) as u32;
-            ctx.screen.cy = (ctx.screen.cy + n).min(ctx.screen.size_y().saturating_sub(1));
+            let cy = ctx.screen.cy.saturating_add(n);
+            ctx.screen.cy = cy.min(ctx.screen.size_y().saturating_sub(1));
         }
         Cuf => {
             let n = ctx.param_or(0, 1).max(1) as u32;
-            ctx.screen.cx = (ctx.screen.cx + n).min(ctx.screen.size_x().saturating_sub(1));
+            let cx = ctx.screen.cx.saturating_add(n);
+            ctx.screen.cx = cx.min(ctx.screen.size_x().saturating_sub(1));
         }
         Cub => {
             let n = ctx.param_or(0, 1).max(1) as u32;
@@ -425,7 +427,7 @@ fn dispatch_csi_command(ctx: &mut InputCtx, cmd: CsiType) {
                 1 => {
                     // clear from start of screen to cursor
                     for y in 0..=ctx.screen.cy {
-                        let max_x = if y == ctx.screen.cy { ctx.screen.cx + 1 } else { ctx.screen.size_x() };
+                        let max_x = if y == ctx.screen.cy { ctx.screen.cx.saturating_add(1) } else { ctx.screen.size_x() };
                         for x in 0..max_x {
                             ctx.screen.grid.view_set_cell(x, y, &GridCell::default_cell());
                         }
@@ -591,8 +593,8 @@ fn dispatch_esc(ctx: &mut InputCtx, _ch: u8) {
     // ESC dispatch - handle common sequences
     if ctx.interm_len == 0 {
         match _ch {
-            b'D' => { ctx.screen.cy += 1; /* IND */ }
-            b'E' => { ctx.screen.cx = 0; ctx.screen.cy += 1; /* NEL */ }
+            b'D' => { ctx.screen.cy = ctx.screen.cy.saturating_add(1); /* IND */ }
+            b'E' => { ctx.screen.cx = 0; ctx.screen.cy = ctx.screen.cy.saturating_add(1); /* NEL */ }
             b'M' => { ctx.screen.cy = ctx.screen.cy.saturating_sub(1); /* RI */ }
             b'7' => { /* DECSC - save cursor */ ctx.screen.mode |= 2; }
             b'8' => { /* DECRC - restore cursor */ ctx.screen.mode &= !2; }
