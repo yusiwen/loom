@@ -57,6 +57,7 @@ pub struct ClientState {
     pub cwd: String,
     pub pid: u32,
     pub attached: bool,
+    pub pending_size: Option<(u32, u32)>,
 }
 
 /// The server manages sessions, windows, clients and the event loop.
@@ -358,6 +359,7 @@ impl Server {
             cwd: String::new(),
             pid: 0,
             attached: false,
+            pending_size: None,
         };
 
         self.clients.insert(token, client);
@@ -408,6 +410,7 @@ impl Server {
                 cwd: String::new(),
                 pid: 0,
                 attached: false,
+                pending_size: None,
             };
 
             client.peer.register(
@@ -600,14 +603,19 @@ impl Server {
                             let cwd = self.clients.get(&token)
                                 .map(|c| c.cwd.clone())
                                 .unwrap_or_else(|| "/tmp".to_string());
+                            // Use pending terminal size if available
+                            let (sx, sy) = self.clients.get(&token)
+                                .and_then(|c| c.pending_size)
+                                .unwrap_or((80, 24));
+                            loom_core::log_debug!(self.log, "dispatch", "window size: {}x{}", sx, sy);
                             let mut session = Session::new(None, &cwd);
-                            let mut window = Window::new(80, 24);
+                            let mut window = Window::new(sx, sy);
                             let wid = window.id;
                             let sid = session.id;
 
                             // Insert window first so spawn_pane can find it
                             self.windows.insert(wid, window);
-                            let _pane_id = self.spawn_pane(wid, 80, 24, &cwd);
+                            let _pane_id = self.spawn_pane(wid, sx, sy, &cwd);
 
                             session.attach_window(0, wid);
                             self.sessions.insert(sid, session);
@@ -654,7 +662,7 @@ impl Server {
                 self.send_to(token, &Message::Exit)?;
             }
             Message::Resize { sx, sy } => {
-                if let Some(client) = self.clients.get(&token) {
+                if let Some(client) = self.clients.get_mut(&token) {
                     if let Some(sid) = client.session_id {
                         if let Some(session) = self.sessions.get(&sid) {
                             if let Some(wl) = session.current_winlink() {
@@ -669,6 +677,9 @@ impl Server {
                                 }
                             }
                         }
+                    } else {
+                        // No session yet — store size for when window is created
+                        client.pending_size = Some((sx, sy));
                     }
                 }
             }
