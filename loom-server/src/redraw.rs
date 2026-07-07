@@ -97,6 +97,17 @@ pub fn redraw_window(window: &Window, output: &mut impl std::io::Write) -> std::
         // Fill remaining space on line with blanks
         write!(output, "\x1b[0m\x1b[K")?;
     }
+    // Reset attributes and position cursor at the active pane's cursor
+    write!(output, "\x1b[0m")?;
+    if let Some(pid) = window.active_pane_id {
+        if let Some(pane) = window.panes.get(&pid) {
+            let cx = pane.xoff + pane.screen.cx as i32;
+            let cy = pane.yoff + pane.screen.cy as i32;
+            if cx >= 0 && cy >= 0 {
+                write!(output, "\x1b[{};{}H", cy + 1, cx + 1)?;
+            }
+        }
+    }
     output.flush()?;
     Ok(())
 }
