@@ -1,3 +1,4 @@
+use loom_core::colour::{COLOUR_FLAG_256, COLOUR_FLAG_RGB};
 use loom_core::grid_cell::*;
 use loom_core::session::Window;
 
@@ -46,23 +47,44 @@ pub fn redraw_window(window: &Window, output: &mut impl std::io::Write) -> std::
                 if attr & GRID_ATTR_HIDDEN != 0 { sgr.push_str(";8"); }
                 if attr & GRID_ATTR_STRIKETHROUGH != 0 { sgr.push_str(";9"); }
 
-                // Foreground color
+                // Foreground colour — match tmux's colour flag scheme
                 if fg != 8 {
-                    sgr.push_str(&format!(
-                        ";38;2;{};{};{}",
-                        ((fg >> 16) & 0xff) as u8,
-                        ((fg >> 8) & 0xff) as u8,
-                        (fg & 0xff) as u8,
-                    ));
+                    if fg & COLOUR_FLAG_RGB != 0 {
+                        // 24-bit RGB: \033[38;2;R;G;Bm
+                        let r = ((fg >> 16) & 0xff) as u8;
+                        let g = ((fg >> 8) & 0xff) as u8;
+                        let b = (fg & 0xff) as u8;
+                        sgr.push_str(&format!(";38;2;{};{};{}", r, g, b));
+                    } else if fg & COLOUR_FLAG_256 != 0 || fg >= 16 {
+                        // 256-colour: \033[38;5;Nm
+                        sgr.push_str(&format!(";38;5;{}", fg & 0xff));
+                    } else {
+                        // Indexed 0-15: \033[3Xm / \033[9Xm
+                        let idx = fg & 0xff;
+                        if idx < 8 {
+                            sgr.push_str(&format!(";{}", 30 + idx));
+                        } else {
+                            sgr.push_str(&format!(";{}", 90 + idx - 8));
+                        }
+                    }
                 }
-                // Background color
+                // Background colour
                 if bg != 8 {
-                    sgr.push_str(&format!(
-                        ";48;2;{};{};{}",
-                        ((bg >> 16) & 0xff) as u8,
-                        ((bg >> 8) & 0xff) as u8,
-                        (bg & 0xff) as u8,
-                    ));
+                    if bg & COLOUR_FLAG_RGB != 0 {
+                        let r = ((bg >> 16) & 0xff) as u8;
+                        let g = ((bg >> 8) & 0xff) as u8;
+                        let b = (bg & 0xff) as u8;
+                        sgr.push_str(&format!(";48;2;{};{};{}", r, g, b));
+                    } else if bg & COLOUR_FLAG_256 != 0 || bg >= 16 {
+                        sgr.push_str(&format!(";48;5;{}", bg & 0xff));
+                    } else {
+                        let idx = bg & 0xff;
+                        if idx < 8 {
+                            sgr.push_str(&format!(";{}", 40 + idx));
+                        } else {
+                            sgr.push_str(&format!(";{}", 100 + idx - 8));
+                        }
+                    }
                 }
                 sgr.push('m');
                 write!(output, "{}", sgr)?;
