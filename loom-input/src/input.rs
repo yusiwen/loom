@@ -259,6 +259,7 @@ fn handle_c0(ctx: &mut InputCtx, ch: u8) {
             ctx.screen.cx = tab.min(ctx.screen.size_x().saturating_sub(1));
         }
         0x0a | 0x0b | 0x0c => { // LF, VT, FF
+            ctx.screen.cx = 0; // implicit carriage return
             ctx.screen.cy += 1;
             if ctx.screen.cy >= ctx.screen.size_y() {
                 ctx.screen.cy = ctx.screen.size_y() - 1;
