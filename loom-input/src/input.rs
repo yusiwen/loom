@@ -25,6 +25,7 @@ pub enum InputState {
     ConsumeSt,
 }
 
+#[allow(dead_code)]
 const ANYWHERE: &[Transition] = &[
     Transition::new(0x18, 0x18, Some(handle_c0), Some(InputState::Ground)),
     Transition::new(0x1a, 0x1a, Some(handle_c0), Some(InputState::Ground)),
@@ -86,11 +87,12 @@ pub struct InputCtx<'a> {
     // current cell being built
     pub cell: GridCell,
     // flags
+    #[allow(dead_code)]
     flags: u8,
 
     // UTF-8 state
-    utf8_data: Utf8Data,
-    utf8_started: bool,
+    #[allow(dead_code)] utf8_data: Utf8Data,
+    #[allow(dead_code)] utf8_started: bool,
 }
 
 impl<'a> InputCtx<'a> {
@@ -157,6 +159,7 @@ impl<'a> InputCtx<'a> {
         }
     }
 
+    #[allow(dead_code)]
     fn clear(&mut self) {
         self.interm_len = 0;
         self.param_len = 0;
@@ -164,6 +167,7 @@ impl<'a> InputCtx<'a> {
         self.input_buf.clear();
     }
 
+    #[allow(dead_code)]
     fn collect_parameter(&mut self) {
         if self.param_len >= self.param_buf.len() {
             return;
@@ -172,6 +176,7 @@ impl<'a> InputCtx<'a> {
         self.param_len += 1;
     }
 
+    #[allow(dead_code)]
     fn collect_intermediate(&mut self, ch: u8) {
         if self.interm_len >= self.interm_buf.len() {
             return;
@@ -180,6 +185,7 @@ impl<'a> InputCtx<'a> {
         self.interm_len += 1;
     }
 
+    #[allow(dead_code)]
     fn collect_input(&mut self, ch: u8) {
         self.input_buf.push(ch);
     }
@@ -237,6 +243,7 @@ impl<'a> InputCtx<'a> {
         }
     }
 
+    #[allow(dead_code)]
     fn has_intermediate(&self, c: u8) -> bool {
         self.interm_len == 1 && self.interm_buf[0] == c
     }

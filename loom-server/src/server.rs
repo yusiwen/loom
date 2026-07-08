@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::io;
-use std::os::unix::io::{AsFd, BorrowedFd, FromRawFd, RawFd};
+use std::os::unix::io::{BorrowedFd, FromRawFd, RawFd};
 use std::time::Duration;
 
 use mio::net::UnixStream;
@@ -19,6 +19,7 @@ use crate::spawn as spawner;
 /// Token for the accept listener.
 const ACCEPT_TOKEN: Token = Token(0);
 /// Signal notification token.
+#[allow(dead_code)]
 const SIGNAL_TOKEN: Token = Token(1);
 /// Waker token.
 const WAKER_TOKEN: Token = Token(2);
@@ -637,7 +638,7 @@ impl Server {
                                 .unwrap_or((80, 24));
                             loom_core::log_debug!(self.log, "dispatch", "window size: {}x{}", sx, sy);
                             let mut session = Session::new(None, &cwd);
-                            let mut window = Window::new(sx, sy);
+                            let window = Window::new(sx, sy);
                             let wid = window.id;
                             let sid = session.id;
 

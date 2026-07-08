@@ -5,6 +5,7 @@ use crate::cmd::{Cmd, CmdCtx, CmdRetval, Args};
 
 // ── helpers ──
 
+#[allow(dead_code)]
 fn find_session(sessions: &HashMap<u32, Session>, sid: Option<u32>, target: &str) -> Option<u32> {
     for (&id, s) in sessions {
         if s.name == target || format!("{}", id) == target { return Some(id); }
@@ -35,6 +36,7 @@ fn find_pane(sessions: &HashMap<u32, Session>, windows: &HashMap<u32, Window>, s
     active_pane_id(sessions, windows, sid)
 }
 
+#[allow(dead_code)]
 fn current_pane_id(sessions: &HashMap<u32, Session>, windows: &HashMap<u32, Window>, ctx: &CmdCtx) -> Option<u32> {
     let sid = ctx.session_id?;
     active_pane_id(sessions, windows, sid)
@@ -57,6 +59,7 @@ fn get_or_create_session(ctx: &mut CmdCtx, args: &Args) -> Option<u32> {
 }
 
 // ── macro to reduce boilerplate ──
+#[allow(unused_macros)]
 macro_rules! with_window {
     ($ctx:expr, $code:block) => {{
         let sid = match $ctx.session_id { Some(s) => s, None => return CmdRetval::Error };
@@ -288,7 +291,7 @@ impl Cmd for SendKeys {
                         "Tab" => { screen.cx = ((screen.cx / 8) + 1) * 8;
                             if screen.cx >= screen.size_x() { screen.cx = screen.size_x() - 1; } }
                         "Escape" | "Esc" => {}
-                        "C-c" | "C-c" => {}
+                        "C-c" => {}
                         _ => { for ch in key.chars() {
                             let gc = loom_core::grid_cell::GridCell { data: loom_core::utf8::Utf8Data::new(ch), ..Default::default() };
                             screen.grid.view_set_cell(screen.cx, screen.cy, &gc); screen.cx += 1;
@@ -485,7 +488,7 @@ impl Cmd for ShowOptions {
     fn name(&self) -> &'static str { "show-options" }
     fn alias(&self) -> &'static str { "show" }
     fn usage(&self) -> &'static str { "show-options [-gopqsvw] [-t target-window] [option]" }
-    fn exec(&self, ctx: &mut CmdCtx, args: &Args) -> CmdRetval {
+    fn exec(&self, ctx: &mut CmdCtx, _args: &Args) -> CmdRetval {
         let sid = match ctx.session_id { Some(s) => s, None => return CmdRetval::Normal };
         if let Some(session) = ctx.sessions.get(&sid) {
             for entry in session.options.iter() {
