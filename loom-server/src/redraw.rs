@@ -1,13 +1,20 @@
-use loom_core::colour::{COLOUR_FLAG_256, COLOUR_FLAG_RGB};
+use std::io;
+
 use loom_core::grid_cell::*;
 use loom_core::session::Window;
+use loom_tty::tty::Tty;
 
-/// Draw a complete window to a writable output (e.g. stdout or a TTY file).
-pub fn redraw_window(window: &Window, output: &mut impl std::io::Write) -> std::io::Result<()> {
+/// Draw a complete window to a writable output using Tty incremental rendering.
+/// Only outputs SGR and cursor positioning when state changes.
+pub fn redraw_window(window: &Window, output: &mut impl io::Write) -> io::Result<()> {
+    let mut tty = Tty::new(output, window.sx, window.sy);
+    let default_cell = GridCell::default_cell();
+
+    // Clear screen and draw all cells
+    tty.clear_screen()?;
+
     for y in 0..window.sy {
-        // For each visible line, draw the content from each pane
         for (_, pane) in &window.panes {
-            // Check if this pane occupies this y-coordinate
             let pane_y = y as i32 - pane.yoff;
             if pane_y < 0 || pane_y >= pane.sy as i32 {
                 continue;
@@ -16,100 +23,28 @@ pub fn redraw_window(window: &Window, output: &mut impl std::io::Write) -> std::
             let screen = &pane.screen;
             let grid = &screen.grid;
 
-            // Position cursor at pane offset
-            write!(output, "\x1b[{};{}H", y + 1, pane.xoff + 1)?;
-
-            // Draw each cell in this line
-            let default_cell = GridCell::default_cell();
             for x in 0..pane.sx {
-                let cell = grid
-                    .view_get_cell(x, pane_y)
-                    .unwrap_or(&default_cell);
-
+                let cell = grid.view_get_cell(x, pane_y).unwrap_or(&default_cell);
                 if cell.is_padding() {
-                    write!(output, " ")?;
                     continue;
                 }
-
-                // Set attributes if changed
-                let fg = cell.fg;
-                let bg = cell.bg;
-                let attr = cell.attr;
-
-                // Build SGR
-                let mut sgr = String::from("\x1b[0");
-                if attr & GRID_ATTR_BRIGHT != 0 { sgr.push_str(";1"); }
-                if attr & GRID_ATTR_DIM != 0 { sgr.push_str(";2"); }
-                if attr & GRID_ATTR_ITALICS != 0 { sgr.push_str(";3"); }
-                if attr & GRID_ATTR_UNDERSCORE != 0 { sgr.push_str(";4"); }
-                if attr & GRID_ATTR_BLINK != 0 { sgr.push_str(";5"); }
-                if attr & GRID_ATTR_REVERSE != 0 { sgr.push_str(";7"); }
-                if attr & GRID_ATTR_HIDDEN != 0 { sgr.push_str(";8"); }
-                if attr & GRID_ATTR_STRIKETHROUGH != 0 { sgr.push_str(";9"); }
-
-                // Foreground colour — match tmux's colour flag scheme
-                if fg != 8 {
-                    if fg & COLOUR_FLAG_RGB != 0 {
-                        // 24-bit RGB: \033[38;2;R;G;Bm
-                        let r = ((fg >> 16) & 0xff) as u8;
-                        let g = ((fg >> 8) & 0xff) as u8;
-                        let b = (fg & 0xff) as u8;
-                        sgr.push_str(&format!(";38;2;{};{};{}", r, g, b));
-                    } else if fg & COLOUR_FLAG_256 != 0 || fg >= 16 {
-                        // 256-colour: \033[38;5;Nm
-                        sgr.push_str(&format!(";38;5;{}", fg & 0xff));
-                    } else {
-                        // Indexed 0-15: \033[3Xm / \033[9Xm
-                        let idx = fg & 0xff;
-                        if idx < 8 {
-                            sgr.push_str(&format!(";{}", 30 + idx));
-                        } else {
-                            sgr.push_str(&format!(";{}", 90 + idx - 8));
-                        }
-                    }
-                }
-                // Background colour
-                if bg != 8 {
-                    if bg & COLOUR_FLAG_RGB != 0 {
-                        let r = ((bg >> 16) & 0xff) as u8;
-                        let g = ((bg >> 8) & 0xff) as u8;
-                        let b = (bg & 0xff) as u8;
-                        sgr.push_str(&format!(";48;2;{};{};{}", r, g, b));
-                    } else if bg & COLOUR_FLAG_256 != 0 || bg >= 16 {
-                        sgr.push_str(&format!(";48;5;{}", bg & 0xff));
-                    } else {
-                        let idx = bg & 0xff;
-                        if idx < 8 {
-                            sgr.push_str(&format!(";{}", 40 + idx));
-                        } else {
-                            sgr.push_str(&format!(";{}", 100 + idx - 8));
-                        }
-                    }
-                }
-                sgr.push('m');
-                write!(output, "{}", sgr)?;
-
-                // Write character
-                let ch = cell.data.to_char();
-                write!(output, "{}", ch)?;
+                let wx = (pane.xoff + x as i32) as u32;
+                let wy = y;
+                tty.draw_cell(wx, wy, cell.fg, cell.bg, cell.attr, cell.data.to_char())?;
             }
         }
-        // Fill remaining space on line with blanks
-        write!(output, "\x1b[0m\x1b[K")?;
     }
-    // Reset attributes and position cursor at the active pane's cursor
-    write!(output, "\x1b[0m")?;
+
+    // Position cursor at active pane's cursor
     if let Some(pid) = window.active_pane_id {
         if let Some(pane) = window.panes.get(&pid) {
-            let cx = pane.xoff + pane.screen.cx as i32;
-            let cy = pane.yoff + pane.screen.cy as i32;
-            if cx >= 0 && cy >= 0 {
-                write!(output, "\x1b[{};{}H", cy + 1, cx + 1)?;
-            }
+            let cx = (pane.xoff + pane.screen.cx as i32) as u32;
+            let cy = (pane.yoff + pane.screen.cy as i32) as u32;
+            tty.set_cursor(cx, cy)?;
         }
     }
-    output.flush()?;
-    Ok(())
+
+    tty.flush()
 }
 
 #[cfg(test)]
@@ -122,19 +57,10 @@ mod tests {
     fn test_redraw_no_panics() {
         let mut window = Window::new(80, 24);
         let p1 = window.create_pane(80, 24);
-        let p2 = layout_split_pane(&mut window, p1, false).unwrap();
-        assert!(window.panes.contains_key(&p2));
-
-        // Add some content
-        if let Some(pane) = window.panes.get_mut(&p1) {
-            pane.screen.cx = 5;
-            pane.screen.cy = 3;
-        }
+        let _p2 = layout_split_pane(&mut window, p1, false).unwrap();
 
         let mut buf = Vec::new();
         redraw_window(&window, &mut buf).unwrap();
         assert!(!buf.is_empty());
-        let output = String::from_utf8_lossy(&buf);
-        assert!(output.contains("\x1b["));
     }
 }

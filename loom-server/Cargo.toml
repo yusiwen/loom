@@ -9,3 +9,4 @@ nix = { version = "0.29", features = ["fs", "socket", "signal"] }
 loom-core = { path = "../loom-core" }
 loom-input = { path = "../loom-input" }
 loom-ipc = { path = "../loom-ipc" }
+loom-tty = { path = "../loom-tty" }
