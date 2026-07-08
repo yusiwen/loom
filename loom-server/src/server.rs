@@ -183,6 +183,32 @@ impl Server {
         Ok(())
     }
 
+    /// Process one event loop iteration. Returns `false` if server should exit.
+    pub fn process_once(&mut self) -> io::Result<bool> {
+        if self.exit {
+            return Ok(false);
+        }
+        let mut events = Events::with_capacity(1024);
+        match self.poll.poll(&mut events, Some(Duration::from_millis(10))) {
+            Ok(_) => {}
+            Err(ref e) if e.kind() == io::ErrorKind::Interrupted => return Ok(true),
+            Err(e) => return Err(e),
+        }
+
+        for event in &events {
+            let token = event.token();
+            if token == ACCEPT_TOKEN {
+                self.handle_accept()?;
+            } else if token.0 >= PTY_BASE as usize {
+                self.handle_pty_event(event)?;
+            } else {
+                self.handle_client_event(token, event)?;
+            }
+        }
+        self.poll_ptys()?;
+        Ok(true)
+    }
+
     /// Start the server event loop.
     pub fn run(&mut self) -> io::Result<()> {
         let mut events = Events::with_capacity(1024);
@@ -345,9 +371,11 @@ impl Server {
     pub fn add_client_stream(&mut self, std_stream: std::os::unix::net::UnixStream) -> io::Result<Token> {
         std_stream.set_nonblocking(true)?;
         let stream = mio::net::UnixStream::from_std(std_stream);
-        let peer = Peer::new(stream);
+        let mut peer = Peer::new(stream);
         let token = Token(CLIENT_BASE + self.next_client_token);
         self.next_client_token += 1;
+
+        peer.register(self.poll.registry(), token, Interest::READABLE | Interest::WRITABLE)?;
 
         let client = ClientState {
             peer,
