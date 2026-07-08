@@ -145,6 +145,12 @@ fn connect_and_run(socket_path: &str, cmd_args: &[String]) -> io::Result<()> {
         }
     }
 
+    // Send terminal size BEFORE creating session (server stores as pending_size)
+    let (sx, sy) = get_terminal_size();
+    loom_core::log_debug!(log, "resize", "sending initial size: {}x{}", sx, sy);
+    send_msg(&mut peer, &Message::Resize { sx, sy })?;
+    peer.flush().ok();
+
     let is_attach = if cmd_args.is_empty() || cmd_args[0] == "attach" || cmd_args[0] == "attach-session" {
         loom_core::log_info!(log, "cmd", "auto: new-session (attach)");
         send_msg(&mut peer, &Message::Command {
