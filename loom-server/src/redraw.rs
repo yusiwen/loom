@@ -4,14 +4,16 @@ use loom_tty::tty::Tty;
 use loom_tty::tty_draw;
 
 /// Draw a full window to a Tty. Used for initial full-screen render on attach.
+/// This invalidates all previous state and clears the screen.
 pub fn redraw_window(tty: &mut Tty, window: &Window) {
     tty.invalidate();
     tty.clear_screen();
     draw_all_panes(tty, window);
 }
 
-/// Redraw a range of rows in an existing Tty. Used for incremental updates.
-pub fn redraw_rows(tty: &mut Tty, window: &Window, _start_y: u32, _end_y: u32) {
+/// Incremental update — draw all panes without clearing the screen.
+/// Tty's persistent state ensures only changed cells produce output.
+pub fn redraw_update(tty: &mut Tty, window: &Window) {
     draw_all_panes(tty, window);
 }
 

@@ -61,6 +61,7 @@ pub struct ClientState {
     pub attached: bool,
     pub pending_size: Option<(u32, u32)>,
     pub tty: Option<Tty>,
+    pub tty_initialized: bool,
 }
 
 /// The server manages sessions, windows, clients and the event loop.
@@ -339,7 +340,7 @@ impl Server {
 
             if let Some(ref mut tty) = client.tty {
                 if let Some(window) = self.windows.get(&wid) {
-                    redraw::redraw_window(tty, window);
+                    redraw::redraw_update(tty, window); // no clear, no invalidate
                     redraw::position_cursor(tty, window);
                     let data = tty.take_output();
                     loom_core::log_debug!(self.log, "pty_data",
@@ -400,6 +401,7 @@ impl Server {
             attached: false,
             pending_size: None,
             tty: None,
+            tty_initialized: false,
         };
 
         self.clients.insert(token, client);
@@ -452,6 +454,7 @@ impl Server {
                 attached: false,
                 pending_size: None,
                 tty: None,
+                tty_initialized: false,
             };
 
             client.peer.register(
@@ -762,13 +765,40 @@ impl Server {
                         }
                     }
                 }
-                // Initialize Tty and mark client as attached
-                if let Some(client) = self.clients.get_mut(&token) {
-                    client.attached = true;
+                // Initialize Tty, do initial full redraw
+                let initial_screen = (|| -> Option<Vec<u8>> {
+                    let client = self.clients.get(&token)?;
+                    let sid = client.session_id?;
+                    let session = self.sessions.get(&sid)?;
+                    let wl = session.current_winlink()?;
+                    let window = self.windows.get(&wl.window_id)?;
                     let sx = client.pending_size.map(|s| s.0).unwrap_or(80);
                     let sy = client.pending_size.map(|s| s.1).unwrap_or(24);
-                    client.tty = Some(Tty::new(sx, sy));
-                    loom_core::log_debug!(self.log, "dispatch", "Tty initialized: {}x{}", sx, sy);
+                    let mut tty = Tty::new(sx, sy);
+                    redraw::redraw_window(&mut tty, window);
+                    let data = tty.take_output();
+                    // Store in client state
+                    if let Some(client) = self.clients.get_mut(&token) {
+                        client.attached = true;
+                        client.tty = Some(Tty::new(sx, sy));
+                        client.tty_initialized = true;
+                    }
+                    Some(data)
+                })();
+                if let Some(data) = initial_screen {
+                    loom_core::log_debug!(self.log, "dispatch",
+                        "initial full redraw ({} bytes)", data.len());
+                    let _ = self.send_to(token, &Message::ScreenUpdate { data });
+                }
+                // Ensure tty exists
+                if let Some(client) = self.clients.get_mut(&token) {
+                    if !client.tty_initialized {
+                        let sx = client.pending_size.map(|s| s.0).unwrap_or(80);
+                        let sy = client.pending_size.map(|s| s.1).unwrap_or(24);
+                        client.tty = Some(Tty::new(sx, sy));
+                        client.tty_initialized = true;
+                    }
+                    client.attached = true;
                 }
             }
             Message::KeyPress { key } => {
