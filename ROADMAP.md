@@ -18,7 +18,7 @@ Target: ~60,000–80,000 lines of Rust, organized as a Cargo workspace.
 | 4 | `loom-input` (VT100 state machine, CSI/ESC dispatch) | ✅ | 5 |
 | 5 | `loom-server` + `loom` binary (session/window/pane, socket, dispatch, PTY spawn, client, redraw, layout split) | ✅ | 28 |
 | 6 | `loom-commands` + `loom-config` (21 commands, queue, format, config parser) | ✅ | 13 |
-| 7 | Interactive I/O loop + integration tests (raw mode, PTY I/O, ScreenUpdate, attach, golden files) | 🔄 | 17 |
+| 7 | Interactive I/O loop + integration tests (raw mode, PTY I/O, ScreenUpdate, attach, golden files) | ❌ Render architecture flawed — see REWRITE.md | 17 |
 
 **Total:** ~6,400 lines of Rust across 6 crates + 1 binary, ~71 tests (58 unit + 13 integration).
 
