@@ -313,31 +313,37 @@ impl Server {
         let preview = &data[..data.len().min(200)];
         loom_core::log_debug!(self.log, "pty_raw", "{} bytes, preview={:?}", data.len(), preview);
 
-        if let Some(window) = self.windows.get_mut(&wid) {
+        let dirty_range = if let Some(window) = self.windows.get_mut(&wid) {
             if let Some(pane) = window.panes.get_mut(&pane_id) {
+                let before_cy = pane.screen.cy;
                 loom_core::log_debug!(self.log, "pty_data", "parsing {} bytes through InputCtx", data.len());
                 let mut ctx = InputCtx::new(&mut pane.screen);
                 ctx.parse_buf(data);
 
-                // DEBUG: log InputCtx state after parse (via ctx, not pane)
                 let (cx, cy) = (ctx.screen.cx, ctx.screen.cy);
                 let (fg, bg, attr) = (ctx.cell.fg, ctx.cell.bg, ctx.cell.attr);
                 loom_core::log_debug!(self.log, "pty_state",
                     "cx={}, cy={}, fg={:#010x}, bg={:#010x}, attr={:#06x}",
                     cx, cy, fg, bg, attr);
-            }
-        }
+                // Track rows affected: from min(before_cy, after_cy) to max
+                let ny = (before_cy.min(cy) as usize).saturating_sub(1); // 1 extra row above for safety
+                Some((ny as u32, cy + 1))
+            } else { None }
+        } else { None };
 
-        if let Some(window) = self.windows.get(&wid) {
-            let mut redraw_buf = Vec::new();
-            if redraw::redraw_window(window, &mut redraw_buf).is_ok() {
-                loom_core::log_debug!(self.log, "pty_data", "sending ScreenUpdate ({} bytes)", redraw_buf.len());
-                // DEBUG: log ScreenUpdate first 200 bytes
-                let preview = &redraw_buf[..redraw_buf.len().min(200)];
-                loom_core::log_debug!(self.log, "redraw", "preview={:?}", preview);
-                let _ = self.send_to(client_token, &Message::ScreenUpdate { data: redraw_buf });
-            } else {
-                loom_core::log_error!(self.log, "pty_data", "redraw failed");
+        if let Some((sy_min, sy_max)) = dirty_range {
+            if let Some(window) = self.windows.get(&wid) {
+                let mut redraw_buf = Vec::new();
+                let ok = redraw::redraw_rows(window, &mut redraw_buf, sy_min, sy_max).is_ok();
+                if ok {
+                    loom_core::log_debug!(self.log, "pty_data", "rows {}-{}: ScreenUpdate ({} bytes)",
+                        sy_min, sy_max, redraw_buf.len());
+                    let preview = &redraw_buf[..redraw_buf.len().min(200)];
+                    loom_core::log_debug!(self.log, "redraw", "preview={:?}", preview);
+                    let _ = self.send_to(client_token, &Message::ScreenUpdate { data: redraw_buf });
+                } else {
+                    loom_core::log_error!(self.log, "pty_data", "redraw_rows failed");
+                }
             }
         }
         Ok(())
