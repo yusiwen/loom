@@ -12,6 +12,7 @@ use loom_core::session::{PaneId, Session, SessionId, Window, WindowId};
 use loom_ipc::message::Message;
 use loom_ipc::peer::Peer;
 use loom_input::input::InputCtx;
+use loom_tty::tty::Tty;
 
 use crate::redraw;
 use crate::spawn as spawner;
@@ -59,6 +60,7 @@ pub struct ClientState {
     pub pid: u32,
     pub attached: bool,
     pub pending_size: Option<(u32, u32)>,
+    pub tty: Option<Tty>,
 }
 
 /// The server manages sessions, windows, clients and the event loop.
@@ -309,13 +311,11 @@ impl Server {
             }
         };
 
-        // DEBUG: log raw PTY data first 200 bytes
         let preview = &data[..data.len().min(200)];
         loom_core::log_debug!(self.log, "pty_raw", "{} bytes, preview={:?}", data.len(), preview);
 
-        let dirty_range = if let Some(window) = self.windows.get_mut(&wid) {
+        if let Some(window) = self.windows.get_mut(&wid) {
             if let Some(pane) = window.panes.get_mut(&pane_id) {
-                let before_cy = pane.screen.cy;
                 loom_core::log_debug!(self.log, "pty_data", "parsing {} bytes through InputCtx", data.len());
                 let mut ctx = InputCtx::new(&mut pane.screen);
                 ctx.parse_buf(data);
@@ -325,24 +325,28 @@ impl Server {
                 loom_core::log_debug!(self.log, "pty_state",
                     "cx={}, cy={}, fg={:#010x}, bg={:#010x}, attr={:#06x}",
                     cx, cy, fg, bg, attr);
-                // Track rows affected: from min(before_cy, after_cy) to max
-                let ny = (before_cy.min(cy) as usize).saturating_sub(1); // 1 extra row above for safety
-                Some((ny as u32, cy + 1))
-            } else { None }
-        } else { None };
+            }
+        }
 
-        if let Some((sy_min, sy_max)) = dirty_range {
-            if let Some(window) = self.windows.get(&wid) {
-                let mut redraw_buf = Vec::new();
-                let ok = redraw::redraw_rows(window, &mut redraw_buf, sy_min, sy_max).is_ok();
-                if ok {
-                    loom_core::log_debug!(self.log, "pty_data", "rows {}-{}: ScreenUpdate ({} bytes)",
-                        sy_min, sy_max, redraw_buf.len());
-                    let preview = &redraw_buf[..redraw_buf.len().min(200)];
+        // Redraw through persistent Tty and send ScreenUpdate
+        if let Some(client) = self.clients.get_mut(&client_token) {
+            // Ensure Tty exists with correct size
+            let sx = client.pending_size.map(|s| s.0).unwrap_or(80);
+            let sy = client.pending_size.map(|s| s.1).unwrap_or(24);
+            if client.tty.is_none() {
+                client.tty = Some(Tty::new(sx, sy));
+            }
+
+            if let Some(ref mut tty) = client.tty {
+                if let Some(window) = self.windows.get(&wid) {
+                    redraw::redraw_window(tty, window);
+                    redraw::position_cursor(tty, window);
+                    let data = tty.take_output();
+                    loom_core::log_debug!(self.log, "pty_data",
+                        "ScreenUpdate ({} bytes)", data.len());
+                    let preview = &data[..data.len().min(200)];
                     loom_core::log_debug!(self.log, "redraw", "preview={:?}", preview);
-                    let _ = self.send_to(client_token, &Message::ScreenUpdate { data: redraw_buf });
-                } else {
-                    loom_core::log_error!(self.log, "pty_data", "redraw_rows failed");
+                    let _ = self.send_to(client_token, &Message::ScreenUpdate { data });
                 }
             }
         }
@@ -395,6 +399,7 @@ impl Server {
             pid: 0,
             attached: false,
             pending_size: None,
+            tty: None,
         };
 
         self.clients.insert(token, client);
@@ -446,6 +451,7 @@ impl Server {
                 pid: 0,
                 attached: false,
                 pending_size: None,
+                tty: None,
             };
 
             client.peer.register(
@@ -518,15 +524,13 @@ impl Server {
                             }
                         }
 
-                        if let Some(window) = self.windows.get(&wid) {
-                            let mut redraw_buf = Vec::new();
-                            if let Err(e) = redraw::redraw_window(window, &mut redraw_buf) {
-                                eprintln!("redraw error: {}", e);
-                            } else {
-                                // Ignore errors - client may have disconnected
-                                let _ = self.send_to(client_token, &Message::ScreenUpdate {
-                                    data: redraw_buf,
-                                });
+                        if let Some(client) = self.clients.get_mut(&client_token) {
+                            if let Some(ref mut tty) = client.tty {
+                                if let Some(window) = self.windows.get(&wid) {
+                                    redraw::redraw_window(tty, window);
+                                    let data = tty.take_output();
+                                    let _ = self.send_to(client_token, &Message::ScreenUpdate { data });
+                                }
                             }
                         }
                     }
@@ -758,9 +762,13 @@ impl Server {
                         }
                     }
                 }
-                // Mark client as attached
+                // Initialize Tty and mark client as attached
                 if let Some(client) = self.clients.get_mut(&token) {
                     client.attached = true;
+                    let sx = client.pending_size.map(|s| s.0).unwrap_or(80);
+                    let sy = client.pending_size.map(|s| s.1).unwrap_or(24);
+                    client.tty = Some(Tty::new(sx, sy));
+                    loom_core::log_debug!(self.log, "dispatch", "Tty initialized: {}x{}", sx, sy);
                 }
             }
             Message::KeyPress { key } => {
