@@ -374,10 +374,10 @@ Remaining follow-ups are noted under each item.
    `layout_resize` + `TIOCSWINSZ` in the `Resize` handler; layout unit tests
    cover reflow.
 8. all unit + golden tests pass — ✅ `cargo test --workspace` green
-   (103 passed, 0 failures, 0 warnings in this sandbox; +10 keybinding
+   (104 passed, 0 failures, 0 warnings in this sandbox; +10 keybinding
    state-machine tests and +2 status-line tests added in Phase B round 1,
-   +8 in round 2: CopyMode state, selection extraction, copy-mode key
-   handling, copy-mode rendering, prefix `[` binding).
+   +9 in round 2: CopyMode state, 3x selection extraction, 2x copy-mode key
+   handling, copy-mode rendering, prefix `[`/`}` bindings).
 
 Note: KPIs 1, 2, 6 are exercised by `tests/interactive_smoke.rs`, which spawns a
 real PTY + shell and drives the wire protocol. It **skips itself** in sandboxes
@@ -475,8 +475,8 @@ to execute it.
   `GRID_ATTR_REVERSE`); `position_cursor` uses the copy cursor while active.
   Non-copy panes keep the fast `tty_draw_line` path, so golden tests are
   untouched.
-- **Client** — `C-b [` binds to `copy-mode` in `keys.rs` (new `binding_for`
-  entry + help text + test).
+- **Client** — `C-b [` binds to `copy-mode` and `C-b }` to `paste-buffer`
+  in `keys.rs` (new `binding_for` entries + help text + tests).
 - Not covered yet: B5 mouse, B8 option scoping; status-line styling is still
   hardcoded (B8). Copy-mode is vi-keys-only (no emacs mode, no search mode,
   no paste into the buffer from outside the server yet).

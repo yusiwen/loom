@@ -57,6 +57,7 @@ fn binding_for(key: u8) -> Option<&'static [u8]> {
         b'l' => b"select-pane -R",
         b'z' => b"resize-pane -Z",
         b'[' => b"copy-mode",
+        b'}' => b"paste-buffer",
         _ => return None,
     })
 }
@@ -234,7 +235,7 @@ Loom keybindings (press C-b first):
   0-9 select window   n/p next/prev window
   h/j/k/l or arrows   select pane        z zoom
   [ copy-mode (vi keys: hjkl/w/b/v/y/q, gg/G, space/?)
-  ? this help
+  } paste-buffer     ? this help
 ";
 
 #[cfg(test)]
@@ -293,6 +294,12 @@ mod tests {
         // C-b [ enters copy-mode (tmux default binding).
         let a = actions_for(&[PREFIX_KEY, b'[']);
         assert_eq!(a, vec![Action::Command(vec!["copy-mode".into()])]);
+    }
+
+    #[test]
+    fn prefix_paste_buffer() {
+        let a = actions_for(&[PREFIX_KEY, b'}']);
+        assert_eq!(a, vec![Action::Command(vec!["paste-buffer".into()])]);
     }
 
     #[test]
