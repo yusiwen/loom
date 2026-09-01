@@ -106,6 +106,11 @@ impl Tty {
         } else {
             let _ = write!(self.out, "{}", ch);
         }
+        // Track the hardware cursor: it now sits one column past the drawn
+        // cell (wide cells advance by their width), so consecutive cells on
+        // the same row need no CUP.
+        self.cx = (x as i32) + (cell.data.width.max(1) as i32);
+        self.cy = y as i32;
     }
 
     /// Clear the screen.

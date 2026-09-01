@@ -12,6 +12,9 @@ use loom_ipc::message::Message;
 use loom_ipc::peer::Peer;
 use loom_server::server::{Server, ServerConfig};
 
+mod keys;
+use keys::{Action, KeyHandler};
+
 const STDIN_TOKEN: Token = Token(0);
 const PEER_TOKEN: Token = Token(1);
 
@@ -86,6 +89,47 @@ fn send_msg(peer: &mut Peer, msg: &Message) -> io::Result<()> {
     Ok(())
 }
 
+/// Ask the server to point this client at an existing session (`select-session`).
+/// Returns `true` if a session was found (server replied `OK` and set the
+/// client's session), `false` otherwise. Used to attach to a live session
+/// instead of always creating a new one.
+fn probe_session(peer: &mut Peer, argv: &[String], log: &Option<Logger>) -> bool {
+    if send_msg(peer, &Message::Command {
+        argc: argv.len() as u32,
+        argv: argv.to_vec(),
+    })
+    .is_err()
+    {
+        return false;
+    }
+    let _ = peer.flush();
+
+    let deadline = std::time::Instant::now() + Duration::from_millis(2000);
+    loop {
+        let _ = peer.flush();
+        match peer.recv() {
+            Ok(Some(Message::Command { argv: r, .. }))
+                if r.len() >= 2 && r[0] == ";" =>
+            {
+                loom_core::log_debug!(log, "probe", "select-session reply: {}", r[1]);
+                return r[1] == "OK";
+            }
+            Ok(Some(m)) => {
+                loom_core::log_debug!(log, "probe", "unexpected: {:?}", m);
+            }
+            Ok(None) => {}
+            Err(e) => {
+                loom_core::log_debug!(log, "probe", "recv error: {}", e);
+                return false;
+            }
+        }
+        if std::time::Instant::now() > deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
 fn connect_and_run(socket_path: &str, cmd_args: &[String]) -> io::Result<()> {
     let log = Logger::new("client");
 
@@ -152,11 +196,26 @@ fn connect_and_run(socket_path: &str, cmd_args: &[String]) -> io::Result<()> {
     peer.flush().ok();
 
     let is_attach = if cmd_args.is_empty() || cmd_args[0] == "attach" || cmd_args[0] == "attach-session" {
-        loom_core::log_info!(log, "cmd", "auto: new-session (attach)");
-        send_msg(&mut peer, &Message::Command {
-            argc: 1, argv: vec!["new-session".into()],
-        })?;
-        true
+        // (B1) Attach to an existing session when one exists; only create a
+        // new session when there is none.
+        let target = cmd_args
+            .iter()
+            .position(|a| a == "-t")
+            .and_then(|i| cmd_args.get(i + 1));
+        let probe_argv: Vec<String> = match target {
+            Some(t) => vec!["select-session".to_string(), t.clone()],
+            None => vec!["select-session".into()],
+        };
+        if probe_session(&mut peer, &probe_argv, &log) {
+            loom_core::log_info!(log, "cmd", "attaching to existing session");
+            true
+        } else {
+            loom_core::log_info!(log, "cmd", "no session yet, sending new-session");
+            send_msg(&mut peer, &Message::Command {
+                argc: 1, argv: vec!["new-session".into()],
+            })?;
+            true
+        }
     } else {
         loom_core::log_info!(log, "cmd", "forwarding: {:?}", cmd_args);
         send_msg(&mut peer, &Message::Command {
@@ -264,6 +323,8 @@ fn run_attached(peer: &mut Peer, log: Option<Logger>) -> io::Result<()> {
     let _ = io::stdout().flush();
 
     let mut last_size = (sx, sy);
+    // (B1) prefix-key state machine: normal -> prefix -> (binding | prompt).
+    let mut keys = KeyHandler::new();
 
     loop {
         match poll.poll(&mut events, Some(Duration::from_millis(200))) {
@@ -293,15 +354,40 @@ fn run_attached(peer: &mut Peer, log: Option<Logger>) -> io::Result<()> {
                             return Ok(());
                         }
                         Ok(n) => {
-                            let keys = buf[..n].to_vec();
-                            if keys == [0x03] || keys == [0x04] {
-                                loom_core::log_debug!(log, "stdin", "Ctrl-C/D, detaching");
-                                let _ = send_msg(peer, &Message::Detach);
-                                let _ = peer.flush();
+                            // (B1) Route keystrokes through the prefix-key
+                            // state machine; only unbound keys reach the PTY.
+                            let actions = keys.feed(&buf[..n]);
+                            let mut detach = false;
+                            for action in actions {
+                                match action {
+                                    Action::Forward(bytes) => {
+                                        let _ = send_msg(peer, &Message::KeyPress { key: bytes });
+                                    }
+                                    Action::Command(argv) => {
+                                        let _ = send_msg(peer, &Message::Command {
+                                            argc: argv.len() as u32,
+                                            argv,
+                                        });
+                                    }
+                                    Action::Detach => {
+                                        loom_core::log_debug!(log, "prefix", "detach requested");
+                                        let _ = send_msg(peer, &Message::Detach);
+                                        detach = true;
+                                    }
+                                    Action::Echo(text) => {
+                                        let _ = io::stdout().write_all(text.as_bytes());
+                                        let _ = io::stdout().flush();
+                                    }
+                                    Action::Beep => {
+                                        let _ = io::stdout().write_all(b"\x07");
+                                        let _ = io::stdout().flush();
+                                    }
+                                }
+                            }
+                            let _ = peer.flush();
+                            if detach {
                                 return Ok(());
                             }
-                            let _ = send_msg(peer, &Message::KeyPress { key: keys });
-                            let _ = peer.flush();
                         }
                         Err(nix::errno::Errno::EAGAIN) => {}
                         Err(e) => {
@@ -327,6 +413,15 @@ fn run_attached(peer: &mut Peer, log: Option<Logger>) -> io::Result<()> {
                             Some(Message::Exit) | Some(Message::Exited) => {
                                 loom_core::log_debug!(log, "peer", "got Exit/Exited");
                                 return Ok(());
+                            }
+                            Some(Message::Command { argv, .. }) => {
+                                // Reply to a `:`-prompt command: print to stdout
+                                // so it is visible in the attached session.
+                                if argv.len() >= 2 && argv[0] == ";" {
+                                    loom_core::log_debug!(log, "peer", "command reply: {}", argv[1]);
+                                    let _ = io::stdout().write_all(format!("\r\n{}", argv[1]).as_bytes());
+                                    let _ = io::stdout().flush();
+                                }
                             }
                             Some(m) => {
                                 loom_core::log_debug!(log, "peer", "unexpected msg: {:?}", m);

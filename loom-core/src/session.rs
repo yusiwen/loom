@@ -396,7 +396,7 @@ mod tests {
 
     #[test]
     fn test_session_attach_detach() {
-        let mut w = Window::new(80, 24);
+        let w = Window::new(80, 24);
         let mut s = Session::new(Some("sess"), "/tmp");
         s.attach_window(0, w.id);
         assert_eq!(s.curw_idx, Some(0));

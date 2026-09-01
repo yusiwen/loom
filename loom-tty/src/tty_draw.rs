@@ -1,5 +1,5 @@
 use crate::tty::Tty;
-use loom_core::grid_cell::{GridCell, GRID_FLAG_PADDING, GRID_FLAG_CLEARED};
+use loom_core::grid_cell::GridCell;
 use loom_core::screen::Screen;
 
 /// State machine states for `tty_draw_line()`, matching tmux's `enum tty_draw_line_state`.

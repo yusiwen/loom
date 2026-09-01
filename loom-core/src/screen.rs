@@ -47,6 +47,18 @@ pub struct Screen {
     pub sel: Option<ScreenSel>,
     pub hyperlinks: bool,
     pub progress_bar: ProgressBar,
+    // ── Alt-screen support ──
+    pub in_alt: bool,
+    saved_grid: Option<Grid>,
+    saved_cx: u32,
+    saved_cy: u32,
+    saved_rupper: u32,
+    saved_rlower: u32,
+    saved_mode: u16,
+    saved_tabs: Vec<bool>,
+    // DECSC/DECRC (ESC 7 / ESC 8, CSI s / CSI u) saved cursor
+    pub decsc_cx: u32,
+    pub decsc_cy: u32,
 }
 
 impl Screen {
@@ -78,6 +90,16 @@ impl Screen {
                 state: ProgressBarState::Hidden,
                 progress: 0,
             },
+            in_alt: false,
+            saved_grid: None,
+            saved_cx: 0,
+            saved_cy: 0,
+            saved_rupper: 0,
+            saved_rlower: 0,
+            saved_mode: 0,
+            saved_tabs: Vec::new(),
+            decsc_cx: 0,
+            decsc_cy: 0,
         }
     }
 
@@ -118,6 +140,63 @@ impl Screen {
 
     pub fn default_cell(&self) -> GridCell {
         GridCell::default_cell()
+    }
+
+    /// Switch to the alternate screen buffer. Saves the main screen state.
+    pub fn to_alt(&mut self) {
+        if self.in_alt {
+            return;
+        }
+        self.in_alt = true;
+        let (gx, gy) = (self.grid.sx, self.grid.sy);
+        self.saved_grid = Some(std::mem::replace(
+            &mut self.grid,
+            Grid::new(gx, gy),
+        ));
+        self.saved_cx = self.cx;
+        self.saved_cy = self.cy;
+        self.saved_rupper = self.rupper;
+        self.saved_rlower = self.rlower;
+        self.saved_mode = self.mode;
+        self.saved_tabs = std::mem::replace(
+            &mut self.tabs,
+            Self::make_default_tabs(self.grid.sx),
+        );
+        self.cx = 0;
+        self.cy = 0;
+        self.rupper = 0;
+        self.rlower = self.grid.sy.saturating_sub(1);
+        self.mode = 0;
+    }
+
+    /// Switch back to the main screen buffer. Restores the saved main screen state.
+    pub fn to_main(&mut self) {
+        if !self.in_alt {
+            return;
+        }
+        self.in_alt = false;
+        if let Some(g) = self.saved_grid.take() {
+            self.grid = g;
+        }
+        self.cx = self.saved_cx;
+        self.cy = self.saved_cy;
+        self.rupper = self.saved_rupper;
+        self.rlower = self.saved_rlower;
+        self.mode = self.saved_mode;
+        self.tabs = std::mem::take(&mut self.saved_tabs);
+        if self.tabs.is_empty() {
+            self.tabs = Self::make_default_tabs(self.grid.sx);
+        }
+    }
+
+    fn make_default_tabs(sx: u32) -> Vec<bool> {
+        let mut tabs = vec![false; sx as usize];
+        for i in (0..sx).step_by(8) {
+            if (i as usize) < tabs.len() {
+                tabs[i as usize] = true;
+            }
+        }
+        tabs
     }
 }
 

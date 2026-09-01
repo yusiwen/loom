@@ -1,19 +1,23 @@
 use std::collections::HashMap;
 use std::io;
-use std::os::unix::io::{BorrowedFd, FromRawFd, RawFd};
+use std::os::unix::io::{AsRawFd, BorrowedFd, RawFd};
+use std::sync::OnceLock;
 use std::time::Duration;
 
-use mio::net::UnixStream;
 use mio::{event::Event, Events, Interest, Poll, Registry, Token, Waker};
 use mio::unix::SourceFd;
 
 use loom_core::log::Logger;
-use loom_core::session::{PaneId, Session, SessionId, Window, WindowId};
+use loom_core::session::{
+    PaneId, Session, SessionId, Window, WindowId, WINLINK_ALERTFLAGS, WINLINK_BELL,
+    WINDOW_ACTIVITY, WINDOW_BELL,
+};
 use loom_ipc::message::Message;
 use loom_ipc::peer::Peer;
-use loom_input::input::InputCtx;
+use loom_input::input::Parser;
 use loom_tty::tty::Tty;
 
+use crate::layout;
 use crate::redraw;
 use crate::spawn as spawner;
 
@@ -28,6 +32,25 @@ const WAKER_TOKEN: Token = Token(2);
 const CLIENT_BASE: usize = 256;
 /// First token for PTY fds.
 const PTY_BASE: usize = 512;
+
+/// Rows reserved for the status line at the bottom of the client terminal.
+/// Window/PTY content is sized to `terminal - STATUS_ROWS` rows (B3).
+const STATUS_ROWS: u32 = 1;
+
+/// Window/PTY height derived from a client terminal height `sy`: the status
+/// line reserves the bottom row(s); a terminal too short to hold a status
+/// line keeps its full height.
+fn content_sy(sy: u32) -> u32 {
+    if sy > STATUS_ROWS {
+        sy - STATUS_ROWS
+    } else {
+        sy
+    }
+}
+
+/// A server command handler: invoked with the command arguments (argv with
+/// the command name removed) for the requesting client's token.
+type CommandHandler = fn(&mut Server, Token, &[String]) -> io::Result<()>;
 
 /// Server configuration.
 #[derive(Clone)]
@@ -75,10 +98,12 @@ pub struct Server {
     next_client_token: usize,
     sessions: HashMap<SessionId, Session>,
     windows: HashMap<WindowId, Window>,
-    listen_fd: Option<RawFd>,
-    /// Map PTY master fd → (client_token, pane_id)
-    attached_panes: HashMap<RawFd, (Token, PaneId)>,
+    listener: Option<std::os::unix::net::UnixListener>,
+    /// Map PTY token → (master_fd, pane_id). One reader per PTY (mio event).
+    pty_fds: HashMap<Token, (RawFd, PaneId)>,
     next_pty_token: usize,
+    /// Persistent per-pane input parsers (state survives across reads).
+    parsers: HashMap<PaneId, Parser>,
     pub exit: bool,
 }
 
@@ -98,9 +123,10 @@ impl Server {
             next_client_token: 0,
             sessions: HashMap::new(),
             windows: HashMap::new(),
-            listen_fd: None,
-            attached_panes: HashMap::new(),
+            listener: None,
+            pty_fds: HashMap::new(),
             next_pty_token: 0,
+            parsers: HashMap::new(),
             exit: false,
         })
     }
@@ -113,76 +139,32 @@ impl Server {
     pub fn create_socket(&mut self) -> io::Result<()> {
         let path = &self.config.socket_path;
 
-        // Remove existing socket file
-        let _ = std::fs::remove_file(path);
-
-        let stream = UnixStream::connect(path);
-        match stream {
+        // If we can connect, another server is already running.
+        match std::os::unix::net::UnixStream::connect(path) {
             Ok(_) => {
                 return Err(io::Error::new(
                     io::ErrorKind::AddrInUse,
                     format!("socket already in use: {}", path),
                 ));
             }
-            Err(ref e) if e.kind() != io::ErrorKind::ConnectionRefused
-                && e.kind() != io::ErrorKind::NotFound =>
-            {
-                return Err(io::Error::new(
-                    e.kind(),
-                    format!("error checking socket: {}", e),
-                ));
-            }
-            _ => {}
+            Err(_) => {} // not running / no socket file yet — proceed to bind
         }
 
-        // Create and bind a listener socket manually
-        let fd = unsafe {
-            let fd = nix::libc::socket(
-                nix::libc::AF_UNIX,
-                nix::libc::SOCK_STREAM | nix::libc::SOCK_CLOEXEC,
-                0,
-            );
-            if fd < 0 {
-                return Err(io::Error::last_os_error());
-            }
-            let mut addr = std::mem::zeroed::<nix::libc::sockaddr_un>();
-            addr.sun_family = nix::libc::AF_UNIX as u16;
-            let path_bytes = path.as_bytes();
-            let max_len = std::mem::size_of_val(&addr.sun_path) - 1;
-            let len = path_bytes.len().min(max_len);
-            std::ptr::copy_nonoverlapping(
-                path_bytes.as_ptr(),
-                addr.sun_path.as_mut_ptr() as *mut u8,
-                len,
-            );
-            let addrlen = std::mem::size_of::<nix::libc::sa_family_t>() + 2 + len;
-            let ret = nix::libc::bind(
-                fd,
-                &addr as *const _ as *const nix::libc::sockaddr,
-                addrlen as u32,
-            );
-            if ret < 0 {
-                nix::libc::close(fd);
-                return Err(io::Error::last_os_error());
-            }
-            let ret = nix::libc::listen(fd, 128);
-            if ret < 0 {
-                nix::libc::close(fd);
-                return Err(io::Error::last_os_error());
-            }
-            fd
-        };
+        // Remove stale socket file, then bind+listen via std (portable to
+        // macOS and Linux, unlike raw accept4 which is Linux-only).
+        let _ = std::fs::remove_file(path);
+        let listener = std::os::unix::net::UnixListener::bind(path)?;
+        listener.set_nonblocking(true)?;
+        let _ = std::fs::set_permissions(
+            path,
+            std::os::unix::fs::PermissionsExt::from_mode(self.config.socket_mode),
+        );
 
-        // Set non-blocking
-        nix::fcntl::fcntl(fd, nix::fcntl::FcntlArg::F_SETFL(nix::fcntl::OFlag::O_NONBLOCK))
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("fcntl: {}", e)))?;
-
-        self.listen_fd = Some(fd);
-
-        // Register with mio
-        use mio::unix::SourceFd;
+        let fd = listener.as_raw_fd();
         let mut source = SourceFd(&fd);
         self.poll.registry().register(&mut source, ACCEPT_TOKEN, Interest::READABLE)?;
+
+        self.listener = Some(listener);
 
         Ok(())
     }
@@ -203,13 +185,12 @@ impl Server {
             let token = event.token();
             if token == ACCEPT_TOKEN {
                 self.handle_accept()?;
-            } else if token.0 >= PTY_BASE as usize {
+            } else if token.0 >= PTY_BASE {
                 self.handle_pty_event(event)?;
             } else {
                 self.handle_client_event(token, event)?;
             }
         }
-        self.poll_ptys()?;
         Ok(true)
     }
 
@@ -228,155 +209,386 @@ impl Server {
                 let token = event.token();
                 if token == ACCEPT_TOKEN {
                     self.handle_accept()?;
-                } else if token.0 >= PTY_BASE as usize {
+                } else if token.0 >= PTY_BASE {
                     self.handle_pty_event(event)?;
                 } else {
                     self.handle_client_event(token, event)?;
                 }
             }
-
-            // Poll PTY fds directly (workaround for mio SourceFd signal fd issue)
-            self.poll_ptys()?;
         }
         Ok(())
     }
 
-    fn poll_ptys(&mut self) -> io::Result<()> {
-        let snapshot: Vec<(RawFd, Token, PaneId)> = self.attached_panes.iter()
-            .map(|(&fd, &(token, pid))| (fd, token, pid))
-            .collect();
-
-        for (fd, client_token, pane_id) in snapshot {
-            if !self.attached_panes.contains_key(&fd) {
-                continue;
+    /// Find the session that owns a given window.
+    fn session_of_window(&self, wid: WindowId) -> Option<SessionId> {
+        for s in self.sessions.values() {
+            if s.windows.values().any(|wl| wl.window_id == wid) {
+                return Some(s.id);
             }
-            if !self.clients.contains_key(&client_token) {
-                loom_core::log_debug!(self.log, "pty_poll", "client gone, cleanup fd={}", fd);
-                self.cleanup_pty(fd);
-                continue;
-            }
+        }
+        None
+    }
 
+    /// Handle a mio event for a PTY master fd. This is the ONLY place PTY
+    /// data is read (P0-1 fix: previously `poll_ptys` also read the same fd).
+    fn handle_pty_event(&mut self, event: &Event) -> io::Result<()> {
+        let token = event.token();
+
+        let (fd, pane_id) = match self.pty_fds.get(&token).copied() {
+            Some(v) => v,
+            None => return Ok(()),
+        };
+
+        if event.is_error() || event.is_read_closed() {
+            self.on_pane_gone(pane_id, fd);
+            return Ok(());
+        }
+
+        if event.is_readable() {
             let mut buf = [0u8; 65536];
-            match nix::unistd::read(fd, &mut buf) {
-                Ok(0) => {
-                    loom_core::log_debug!(self.log, "pty_poll", "EOF on fd={}", fd);
-                    let _ = self.send_to(client_token, &Message::Exited);
-                    self.cleanup_pty(fd);
-                }
-                Ok(n) => {
-                    loom_core::log_debug!(self.log, "pty_poll", "read {} bytes from fd={}", n, fd);
-                    self.process_pty_data(client_token, pane_id, &buf[..n])?;
-                }
-                Err(nix::errno::Errno::EAGAIN) => {
-                    loom_core::log_debug!(self.log, "pty_poll", "EAGAIN on fd={}", fd);
-                }
-                Err(nix::errno::Errno::EINTR) => {}
-                Err(e) => {
-                    loom_core::log_error!(self.log, "pty_poll", "read error on fd={}: {}", fd, e);
-                    self.cleanup_pty(fd);
+            loop {
+                match nix::unistd::read(fd, &mut buf) {
+                    Ok(0) => {
+                        // EOF: the shell exited
+                        loom_core::log_debug!(self.log, "pty", "EOF on pane={} fd={}", pane_id, fd);
+                        self.on_pane_gone(pane_id, fd);
+                        break;
+                    }
+                    Ok(n) => {
+                        self.process_pty_data(pane_id, fd, &buf[..n]);
+                    }
+                    Err(nix::errno::Errno::EAGAIN) => break,
+                    Err(nix::errno::Errno::EINTR) => continue,
+                    Err(e) => {
+                        loom_core::log_error!(self.log, "pty", "read error pane={} fd={}: {}", pane_id, fd, e);
+                        self.on_pane_gone(pane_id, fd);
+                        break;
+                    }
                 }
             }
         }
+
         Ok(())
     }
 
-    fn process_pty_data(&mut self, client_token: Token, pane_id: PaneId, data: &[u8]) -> io::Result<()> {
-        loom_core::log_debug!(self.log, "pty_data", "processing {} bytes for pane={}", data.len(), pane_id);
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            self.process_pty_data_inner(client_token, pane_id, data)
-        }));
-        match result {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => {
-                loom_core::log_error!(self.log, "pty_data", "error: {} (pane={})", e, pane_id);
-            }
-            Err(panic) => {
-                let msg = if let Some(s) = panic.downcast_ref::<&str>() { s.to_string() }
-                          else if let Some(s) = panic.downcast_ref::<String>() { s.clone() }
-                          else { format!("{:?}", panic) };
-                loom_core::log_error!(self.log, "pty_data", "PANIC: {} (pane={}, bytes={})", msg, pane_id, data.len());
+    /// A PTY is gone (shell exited, error). Clean up the fd, parser and
+    /// notify attached clients. The session itself stays alive (P0-6).
+    fn on_pane_gone(&mut self, pane_id: PaneId, fd: RawFd) {
+        // Find the window to know which session to notify.
+        let wid = self
+            .windows
+            .iter()
+            .find(|(_, w)| w.panes.contains_key(&pane_id))
+            .map(|(&id, _)| id);
+
+        // Remove the pty registration.
+        let token = self.pty_fds.iter().find(|(_, (_, p))| *p == pane_id).map(|(t, _)| *t);
+        if let Some(t) = token {
+            let mut source = SourceFd(&fd);
+            let _ = self.poll.registry().deregister(&mut source);
+            self.pty_fds.remove(&t);
+        }
+        unsafe {
+            nix::libc::close(fd);
+        }
+        self.parsers.remove(&pane_id);
+
+        // Mark the pane as dead.
+        if let Some(wid) = wid {
+            if let Some(window) = self.windows.get_mut(&wid) {
+                if let Some(pane) = window.panes.get_mut(&pane_id) {
+                    pane.fd = None;
+                    pane.pid = None;
+                }
             }
         }
-        Ok(())
+
+        // Notify attached clients of this session that the pane exited.
+        if let Some(wid) = wid {
+            if let Some(sid) = self.session_of_window(wid) {
+                let tokens: Vec<Token> = self
+                    .clients
+                    .iter()
+                    .filter(|(_, c)| c.session_id == Some(sid) && c.attached)
+                    .map(|(t, _)| *t)
+                    .collect();
+                for t in tokens {
+                    let _ = self.send_to(t, &Message::Exited);
+                }
+            }
+        }
     }
 
-    fn process_pty_data_inner(&mut self, client_token: Token, pane_id: PaneId, data: &[u8]) -> io::Result<()> {
-        let wid = match self.windows.iter()
+    /// Parse PTY output with the pane's persistent parser, write DSR/DA
+    /// responses back to the shell, and broadcast a redraw to attached clients.
+    fn process_pty_data(&mut self, pane_id: PaneId, fd: RawFd, data: &[u8]) {
+        let wid = match self
+            .windows
+            .iter()
             .find(|(_, w)| w.panes.contains_key(&pane_id))
             .map(|(&id, _)| id)
         {
-            Some(wid) => wid,
-            None => {
-                loom_core::log_debug!(self.log, "pty_data", "no window for pane={}", pane_id);
-                return Ok(());
+            Some(id) => id,
+            None => return,
+        };
+        let sid = self.session_of_window(wid);
+
+        loom_core::log_debug!(
+            self.log,
+            "pty_data",
+            "processing {} bytes for pane={}",
+            data.len(),
+            pane_id
+        );
+
+        // Parse into the pane's screen using the persistent parser (P0-2, P0-3).
+        // Also surface OSC title (B7), BEL (B6) and the dirty flag from the
+        // parsed data.
+        let (response, title, bell, dirty) = {
+            let mut resp = Vec::new();
+            let mut title = String::new();
+            let mut bell = false;
+            let mut dirty = false;
+            if let Some(window) = self.windows.get_mut(&wid) {
+                if let Some(pane) = window.panes.get_mut(&pane_id) {
+                    if let Some(parser) = self.parsers.get_mut(&pane_id) {
+                        parser.parse_buf(&mut pane.screen, data);
+                        resp = parser.take_response();
+                        bell = parser.take_bell();
+                        dirty = parser.take_dirty();
+                    }
+                    if !pane.screen.title.is_empty() {
+                        title = pane.screen.title.clone();
+                    }
+                }
             }
+            (resp, title, bell, dirty)
         };
 
-        let preview = &data[..data.len().min(200)];
-        loom_core::log_debug!(self.log, "pty_raw", "{} bytes, preview={:?}", data.len(), preview);
+        // Write DSR/DA responses back to the PTY master (P0-5).
+        if !response.is_empty() {
+            let bfd = unsafe { BorrowedFd::borrow_raw(fd) };
+            let _ = nix::unistd::write(&bfd, &response);
+        }
 
-        if let Some(window) = self.windows.get_mut(&wid) {
-            if let Some(pane) = window.panes.get_mut(&pane_id) {
-                loom_core::log_debug!(self.log, "pty_data", "parsing {} bytes through InputCtx", data.len());
-                let mut ctx = InputCtx::new(&mut pane.screen);
-                ctx.parse_buf(data);
-
-                let (cx, cy) = (ctx.screen.cx, ctx.screen.cy);
-                let (fg, bg, attr) = (ctx.cell.fg, ctx.cell.bg, ctx.cell.attr);
-                loom_core::log_debug!(self.log, "pty_state",
-                    "cx={}, cy={}, fg={:#010x}, bg={:#010x}, attr={:#06x}",
-                    cx, cy, fg, bg, attr);
+        // (B7) OSC 0/2 title: surface on the window so the status line shows it.
+        let title_present = !title.is_empty();
+        if title_present {
+            if let Some(w) = self.windows.get_mut(&wid) {
+                w.name = title;
             }
         }
 
-        // Redraw through persistent Tty and send ScreenUpdate
-        if let Some(client) = self.clients.get_mut(&client_token) {
-            // Ensure Tty exists with correct size
-            let sx = client.pending_size.map(|s| s.0).unwrap_or(80);
-            let sy = client.pending_size.map(|s| s.1).unwrap_or(24);
-            if client.tty.is_none() {
-                client.tty = Some(Tty::new(sx, sy));
+        // (B6) BEL: flag the window so the status line can mark it as alerted.
+        if bell {
+            if let Some(w) = self.windows.get_mut(&wid) {
+                w.flags |= WINDOW_BELL;
             }
-
-            if let Some(ref mut tty) = client.tty {
-                if let Some(window) = self.windows.get(&wid) {
-                    redraw::redraw_update(tty, window); // no clear, no invalidate
-                    redraw::position_cursor(tty, window);
-                    let data = tty.take_output();
-                    loom_core::log_debug!(self.log, "pty_data",
-                        "ScreenUpdate ({} bytes)", data.len());
-                    let preview = &data[..data.len().min(200)];
-                    loom_core::log_debug!(self.log, "redraw", "preview={:?}", preview);
-                    let _ = self.send_to(client_token, &Message::ScreenUpdate { data });
+            if let Some(sid) = sid {
+                if let Some(s) = self.sessions.get_mut(&sid) {
+                    for wl in s.windows.values_mut() {
+                        if wl.window_id == wid {
+                            wl.flags |= WINLINK_BELL;
+                        }
+                    }
                 }
             }
         }
-        Ok(())
+
+        // Redraw for every attached client of this session. Skip when nothing
+        // visible changed (query-only sequences like DSR/DA produce no screen
+        // output, and the status line is only affected by title/bell changes).
+        if dirty || bell || title_present {
+            if let Some(sid) = sid {
+                self.broadcast_redraw(sid, wid, false);
+            }
+        }
     }
 
-    /// Create a pane with a spawned shell process.
+    /// Send a redraw to every client attached to `sid`.
+    /// `full=true` forces a complete screen clear (used on attach/resize).
+    fn broadcast_redraw(&mut self, sid: SessionId, wid: WindowId, full: bool) {
+        let tokens: Vec<Token> = self
+            .clients
+            .iter()
+            .filter(|(_, c)| c.session_id == Some(sid) && c.attached)
+            .map(|(t, _)| *t)
+            .collect();
+        for token in tokens {
+            self.redraw_for_client(token, wid, full);
+        }
+    }
+
+    fn redraw_for_client(&mut self, token: Token, wid: WindowId, full: bool) {
+        // Ensure the client has a Tty of the right size; optionally reset it.
+        {
+            let client = match self.clients.get_mut(&token) {
+                Some(c) => c,
+                None => return,
+            };
+            let (sx, sy) = client.pending_size.unwrap_or((80, 24));
+            if client.tty.is_none() {
+                client.tty = Some(Tty::new(sx, sy));
+            }
+            if full {
+                if let Some(tty) = client.tty.as_mut() {
+                    tty.invalidate();
+                }
+            }
+        }
+
+        let data = {
+            let window = match self.windows.get(&wid) {
+                Some(w) => w,
+                None => return,
+            };
+            let client = match self.clients.get_mut(&token) {
+                Some(c) => c,
+                None => return,
+            };
+            let mut out = Vec::new();
+            if let Some(tty) = client.tty.as_mut() {
+                if full {
+                    redraw::redraw_window(tty, window);
+                } else {
+                    redraw::redraw_update(tty, window);
+                }
+                // (B3) Status line on the bottom row. Drawn before the final
+                // cursor positioning so the hardware cursor lands in the
+                // content area.
+                let sid = client.session_id.unwrap_or(0);
+                let segments = status_segments(&self.sessions, &self.windows, sid, wid);
+                redraw::draw_status_line(tty, &segments);
+                redraw::position_cursor(tty, window);
+                out = tty.take_output();
+            }
+            out
+        };
+
+        if !data.is_empty() {
+            let _ = self.send_to(token, &Message::ScreenUpdate { data });
+        }
+    }
+
+    /// Create a pane with a spawned shell process and register its PTY with
+    /// the event loop (P0-8: also used by split-window / new-window).
     fn spawn_pane(&mut self, wid: WindowId, sx: u32, sy: u32, cwd: &str) -> Option<PaneId> {
-        let window = self.windows.get_mut(&wid)?;
-        let pid = window.create_pane(sx, sy);
-        loom_core::log_debug!(self.log, "spawn", "pane_id={}, wid={}, cwd={}", pid, wid, cwd);
+        let pane_id = {
+            let window = self.windows.get_mut(&wid)?;
+            window.create_pane(sx, sy)
+        };
+        loom_core::log_debug!(
+            self.log,
+            "spawn",
+            "pane_id={}, wid={}, cwd={}",
+            pane_id, wid, cwd
+        );
 
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
-        loom_core::log_debug!(self.log, "spawn", "calling spawn_pty(shell={}, cwd={})", shell, cwd);
         match spawner::spawn_pty(&[shell.clone()], cwd, sx, sy) {
             Ok((child_pid, master_fd)) => {
-                loom_core::log_info!(self.log, "spawn", "spawn_pty ok: pid={}, fd={}", child_pid, master_fd);
-                if let Some(pane) = window.panes.get_mut(&pid) {
-                    pane.fd = Some(master_fd);
-                    pane.pid = Some(child_pid.as_raw() as u32);
-                    pane.shell = shell;
-                    pane.cwd = cwd.to_string();
+                let pid = child_pid.as_raw() as u32;
+                loom_core::log_info!(
+                    self.log,
+                    "spawn",
+                    "spawn_pty ok: pid={}, fd={}",
+                    child_pid, master_fd
+                );
+
+                // Make the master fd non-blocking for the mio event loop.
+                let _ = nix::fcntl::fcntl(
+                    master_fd,
+                    nix::fcntl::FcntlArg::F_SETFL(nix::fcntl::OFlag::O_NONBLOCK),
+                );
+
+                // Register with the event loop — the single reader path.
+                let pty_token = Token(PTY_BASE + self.next_pty_token);
+                self.next_pty_token += 1;
+                let mut source = SourceFd(&master_fd);
+                if self
+                    .poll
+                    .registry()
+                    .register(&mut source, pty_token, Interest::READABLE)
+                    .is_ok()
+                {
+                    self.pty_fds.insert(pty_token, (master_fd, pane_id));
+                    loom_core::log_info!(
+                        self.log,
+                        "spawn",
+                        "PTY registered token={:?}",
+                        pty_token
+                    );
+                } else {
+                    loom_core::log_error!(self.log, "spawn", "failed to register PTY fd");
+                }
+
+                // Persistent parser for this pane (P0-2).
+                self.parsers.insert(pane_id, Parser::new());
+
+                // Record process info on the pane.
+                if let Some(window) = self.windows.get_mut(&wid) {
+                    if let Some(pane) = window.panes.get_mut(&pane_id) {
+                        pane.fd = Some(master_fd);
+                        pane.pid = Some(pid);
+                        pane.shell = shell;
+                        pane.cwd = cwd.to_string();
+                    }
                 }
             }
             Err(e) => {
                 loom_core::log_error!(self.log, "spawn", "spawn_pty FAILED: {}", e);
             }
         }
-        Some(pid)
+        Some(pane_id)
+    }
+
+    /// Kill a pane's process, close its PTY, and deregister it.
+    fn close_pane_process(&mut self, pane_id: PaneId, pid: Option<u32>, fd: Option<RawFd>) {
+        if let Some(pid) = pid {
+            kill_process_group(pid);
+        }
+        if let Some(fd) = fd {
+            let token = self
+                .pty_fds
+                .iter()
+                .find(|(_, (f, p))| *f == fd && *p == pane_id)
+                .map(|(t, _)| *t);
+            if let Some(t) = token {
+                let mut source = SourceFd(&fd);
+                let _ = self.poll.registry().deregister(&mut source);
+                self.pty_fds.remove(&t);
+            }
+            unsafe {
+                nix::libc::close(fd);
+            }
+        }
+        self.parsers.remove(&pane_id);
+    }
+
+    /// Kill a whole window: every pane's process + PTY.
+    fn kill_window(&mut self, wid: WindowId) {
+        let panes: Vec<(PaneId, Option<u32>, Option<RawFd>)> =
+            self.windows
+                .get(&wid)
+                .map(|w| w.panes.values().map(|p| (p.id, p.pid, p.fd)).collect())
+                .unwrap_or_default();
+        for (pane_id, pid, fd) in panes {
+            self.close_pane_process(pane_id, pid, fd);
+        }
+        self.windows.remove(&wid);
+    }
+
+    /// Kill a whole session: every window's panes, then the session.
+    fn kill_session(&mut self, sid: SessionId) {
+        let window_ids: Vec<WindowId> = self
+            .sessions
+            .get(&sid)
+            .map(|s| s.windows.values().map(|wl| wl.window_id).collect())
+            .unwrap_or_default();
+        for wid in window_ids {
+            self.kill_window(wid);
+        }
+        self.sessions.remove(&sid);
     }
 
     /// Add a pre-established client stream (for testing).
@@ -410,33 +622,21 @@ impl Server {
 
     fn handle_accept(&mut self) -> io::Result<()> {
         loom_core::log_debug!(self.log, "accept", "handling accept");
-        let fd = match self.listen_fd {
-            Some(fd) => fd,
+        let listener = match self.listener.as_ref() {
+            Some(l) => l,
             None => return Ok(()),
         };
 
         loop {
-            let ret = unsafe {
-                nix::libc::accept4(
-                    fd,
-                    std::ptr::null_mut(),
-                    std::ptr::null_mut(),
-                    nix::libc::SOCK_CLOEXEC | nix::libc::SOCK_NONBLOCK,
-                )
+            let std_stream = match listener.accept() {
+                Ok((stream, _addr)) => stream,
+                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e),
             };
-            if ret < 0 {
-                let err = io::Error::last_os_error();
-                match err.kind() {
-                    io::ErrorKind::WouldBlock => break,
-                    io::ErrorKind::Interrupted => continue,
-                    _ => return Err(err),
-                }
-            }
-            let client_fd = ret;
-
-            let std_stream = unsafe {
-                std::os::unix::net::UnixStream::from_raw_fd(client_fd)
-            };
+            std_stream.set_nonblocking(true).map_err(|e| {
+                io::Error::new(io::ErrorKind::Other, format!("set_nonblocking: {}", e))
+            })?;
             let stream = mio::net::UnixStream::from_std(std_stream);
             let peer = Peer::new(stream);
             let token = Token(CLIENT_BASE + self.next_client_token);
@@ -470,98 +670,10 @@ impl Server {
         Ok(())
     }
 
-    fn handle_pty_event(&mut self, event: &Event) -> io::Result<()> {
-        let token = event.token();
-
-        // Find the fd for this token
-        let fd = match self.attached_panes.iter()
-            .find(|(_, (t, _))| *t == token)
-            .map(|(&fd, _)| fd)
-        {
-            Some(fd) => fd,
-            None => return Ok(()),
-        };
-
-        if event.is_error() || event.is_read_closed() {
-            self.cleanup_pty(fd);
-            return Ok(());
-        }
-
-        if event.is_readable() {
-            let mut buf = vec![0u8; 65536];
-            match nix::unistd::read(fd, &mut buf) {
-                Ok(0) => {
-                    loom_core::log_debug!(self.log, "pty", "EOF on fd={}", fd);
-                    let notify_client = self.attached_panes.get(&fd).map(|&(ct, _)| ct);
-                    self.cleanup_pty(fd);
-                    if let Some(ct) = notify_client {
-                        let _ = self.send_to(ct, &Message::Exited);
-                    }
-                    return Ok(());
-                }
-                Ok(n) => {
-                    buf.truncate(n);
-                    loom_core::log_debug!(self.log, "pty", "read {} bytes from fd={}", n, fd);
-
-                    let (client_token, pane_id) = match self.attached_panes.get(&fd) {
-                        Some(&(ct, pid)) => (ct, pid),
-                        None => return Ok(()),
-                    };
-
-                    // Check if client is still connected
-                    if !self.clients.contains_key(&client_token) {
-                        self.cleanup_pty(fd);
-                        return Ok(());
-                    }
-
-                    let wid = self.windows.iter()
-                        .find(|(_, w)| w.panes.contains_key(&pane_id))
-                        .map(|(&id, _)| id);
-
-                    if let Some(wid) = wid {
-                        if let Some(window) = self.windows.get_mut(&wid) {
-                            if let Some(pane) = window.panes.get_mut(&pane_id) {
-                                let screen = &mut pane.screen;
-                                let mut ctx = InputCtx::new(screen);
-                                ctx.parse_buf(&buf);
-                            }
-                        }
-
-                        if let Some(client) = self.clients.get_mut(&client_token) {
-                            if let Some(ref mut tty) = client.tty {
-                                if let Some(window) = self.windows.get(&wid) {
-                                    redraw::redraw_window(tty, window);
-                                    let data = tty.take_output();
-                                    let _ = self.send_to(client_token, &Message::ScreenUpdate { data });
-                                }
-                            }
-                        }
-                    }
-                }
-                Err(nix::errno::Errno::EAGAIN) => {}
-                Err(e) => {
-                    loom_core::log_error!(self.log, "pty", "read error on fd={}: {}", fd, e);
-                    self.cleanup_pty(fd);
-                }
-            }
-        }
-
-        Ok(())
-    }
-
-    fn cleanup_pty(&mut self, fd: RawFd) {
-        if let Some(&(_, _)) = self.attached_panes.get(&fd) {
-            // Deregister from event loop
-            let mut source = SourceFd(&fd);
-            let _ = self.poll.registry().deregister(&mut source);
-            // Close PTY fd
-            unsafe { nix::libc::close(fd); }
-            self.attached_panes.remove(&fd);
-        }
-    }
-
     fn handle_client_event(&mut self, token: Token, event: &Event) -> io::Result<()> {
         if event.is_error() || event.is_read_closed() || event.is_write_closed() {
+            // Client socket went away. The session (and its PTYs) stay alive.
+            loom_core::log_debug!(self.log, "client", "client {} disconnected", token.0);
             self.clients.remove(&token);
             return Ok(());
         }
@@ -638,167 +750,72 @@ impl Server {
             }
             Message::Command { argc: _, argv } => {
                 loom_core::log_info!(self.log, "dispatch", "Command: {:?}", argv);
-                if argv.len() >= 1 {
-                    match argv[0].as_str() {
-                        "new-session" | "new" => {
-                            loom_core::log_info!(self.log, "dispatch", "creating new session");
-                            let cwd = self.clients.get(&token)
-                                .map(|c| c.cwd.clone())
-                                .unwrap_or_else(|| "/tmp".to_string());
-                            // Use pending terminal size if available
-                            let (sx, sy) = self.clients.get(&token)
-                                .and_then(|c| c.pending_size)
-                                .unwrap_or((80, 24));
-                            loom_core::log_debug!(self.log, "dispatch", "window size: {}x{}", sx, sy);
-                            let mut session = Session::new(None, &cwd);
-                            let window = Window::new(sx, sy);
-                            let wid = window.id;
-                            let sid = session.id;
-
-                            // Insert window first so spawn_pane can find it
-                            self.windows.insert(wid, window);
-                            let _pane_id = self.spawn_pane(wid, sx, sy, &cwd);
-
-                            session.attach_window(0, wid);
-                            self.sessions.insert(sid, session);
-
-                            if let Some(client) = self.clients.get_mut(&token) {
-                                client.session_id = Some(sid);
-                            }
-                        }
-                        "kill-session" => {
-                            if let Some(client) = self.clients.get(&token) {
-                                if let Some(sid) = client.session_id {
-                                    let mut to_remove = Vec::new();
-                                    if let Some(session) = self.sessions.get(&sid) {
-                                        // Collect window IDs to remove
-                                        for (_, wl) in &session.windows {
-                                            to_remove.push(wl.window_id);
-                                        }
-                                    }
-                                    self.sessions.remove(&sid);
-                                    for wid in to_remove {
-                                        self.windows.remove(&wid);
-                                    }
-                                }
-                            }
-                        }
-                        "list-sessions" | "ls" => {
-                            let names: Vec<String> = self.sessions.values()
-                                .map(|s| format!("{}: {} windows", s.name, s.windows.len()))
-                                .collect();
-                            let response = names.join("\n");
-                            self.send_to(token, &Message::Command {
-                                argc: 0,
-                                argv: vec![";".into(), response],
-                            })?;
-                        }
-                        _ => {}
-                    }
-                }
+                self.handle_command(token, &argv)?;
             }
             Message::Detach => {
+                // Detach: the client leaves, but the session keeps running (P0-6).
+                loom_core::log_debug!(self.log, "dispatch", "Detach from token={:?}", token);
                 if let Some(client) = self.clients.get_mut(&token) {
                     client.session_id = None;
+                    client.attached = false;
                 }
                 self.send_to(token, &Message::Exit)?;
             }
             Message::Resize { sx, sy } => {
                 if let Some(client) = self.clients.get_mut(&token) {
-                    if let Some(sid) = client.session_id {
-                        if let Some(session) = self.sessions.get(&sid) {
-                            if let Some(wl) = session.current_winlink() {
-                                if let Some(window) = self.windows.get_mut(&wl.window_id) {
-                                    window.sx = sx;
-                                    window.sy = sy;
-                                    for (_, pane) in &mut window.panes {
-                                        pane.sx = sx;
-                                        pane.sy = sy;
-                                        pane.screen.resize(sx, sy);
-                                    }
-                                }
+                    client.pending_size = Some((sx, sy));
+                }
+                if let Some(sid) = self.clients.get(&token).and_then(|c| c.session_id) {
+                    if let Some(session) = self.sessions.get(&sid) {
+                        if let Some(wl) = session.current_winlink() {
+                            let wid = wl.window_id;
+                            if let Some(window) = self.windows.get_mut(&wid) {
+                                // (B3) the status row is reserved: content height
+                                // is the terminal height minus STATUS_ROWS.
+                                layout::layout_resize(window, sx, content_sy(sy));
                             }
+                            // Notify every PTY in the window of the new size.
+                            let sizes: Vec<(RawFd, u32, u32)> = self
+                                .windows
+                                .get(&wid)
+                                .map(|w| {
+                                    w.panes
+                                        .values()
+                                        .filter_map(|p| p.fd.map(|fd| (fd, p.sx, p.sy)))
+                                        .collect()
+                                })
+                                .unwrap_or_default();
+                            for (fd, px, py) in sizes {
+                                set_pty_size(fd, px, py);
+                            }
+                            self.broadcast_redraw(sid, wid, true);
                         }
-                    } else {
-                        // No session yet — store size for when window is created
-                        client.pending_size = Some((sx, sy));
                     }
                 }
             }
             Message::AttachSession => {
                 loom_core::log_debug!(self.log, "dispatch", "AttachSession from token={:?}", token);
-                if let Some(client) = self.clients.get(&token) {
-                    if let Some(sid) = client.session_id {
-                        if let Some(session) = self.sessions.get(&sid) {
-                            if let Some(wl) = session.current_winlink() {
-                                if let Some(window) = self.windows.get(&wl.window_id) {
-                                    if let Some(active_pane_id) = window.active_pane_id {
-                                        if let Some(pane) = window.panes.get(&active_pane_id) {
-                                            if let Some(pfd) = pane.fd {
-                                                loom_core::log_debug!(self.log, "dispatch", "attaching PTY fd={}", pfd);
-                                                // Set PTY fd to non-blocking for poll_ptys
-                                                let flags = nix::fcntl::fcntl(pfd, nix::fcntl::FcntlArg::F_GETFL)
-                                                    .unwrap_or(0);
-                                                let _ = nix::fcntl::fcntl(pfd, nix::fcntl::FcntlArg::F_SETFL(
-                                                    nix::fcntl::OFlag::from_bits_truncate(flags | nix::libc::O_NONBLOCK as i32)
-                                                ));
-                                                let pty_token = Token(PTY_BASE + self.next_pty_token);
-                                                self.next_pty_token += 1;
-                                                let mut source = SourceFd(&pfd);
-                                                if self.poll.registry().register(
-                                                    &mut source,
-                                                    pty_token,
-                                                    Interest::READABLE,
-                                                ).is_ok() {
-                                                    self.attached_panes.insert(pfd, (token, active_pane_id));
-                                                    loom_core::log_info!(self.log, "dispatch", "PTY registered token={:?}", pty_token);
-                                                } else {
-                                                    loom_core::log_error!(self.log, "dispatch", "failed to register PTY fd");
-                                                }
-                                            } else {
-                                                loom_core::log_error!(self.log, "dispatch", "AttachSession: pane.fd is None (spawn failed?)");
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                // Initialize Tty, do initial full redraw
-                let initial_screen = (|| -> Option<Vec<u8>> {
-                    let client = self.clients.get(&token)?;
-                    let sid = client.session_id?;
-                    let session = self.sessions.get(&sid)?;
-                    let wl = session.current_winlink()?;
-                    let window = self.windows.get(&wl.window_id)?;
-                    let sx = client.pending_size.map(|s| s.0).unwrap_or(80);
-                    let sy = client.pending_size.map(|s| s.1).unwrap_or(24);
-                    let mut tty = Tty::new(sx, sy);
-                    redraw::redraw_window(&mut tty, window);
-                    let data = tty.take_output();
-                    // Store in client state
+                // The PTY was registered at spawn time; here we only set up
+                // the client's rendering state and push an initial full redraw.
+                let sid = self.clients.get(&token).and_then(|c| c.session_id);
+                let wid = sid
+                    .and_then(|sid| self.sessions.get(&sid))
+                    .and_then(|s| s.current_winlink())
+                    .map(|wl| wl.window_id);
+
+                if let Some(_sid) = sid {
                     if let Some(client) = self.clients.get_mut(&token) {
+                        let (sx, sy) = client.pending_size.unwrap_or((80, 24));
+                        if client.tty.is_none() {
+                            client.tty = Some(Tty::new(sx, sy));
+                        }
                         client.attached = true;
-                        client.tty = Some(Tty::new(sx, sy));
                         client.tty_initialized = true;
                     }
-                    Some(data)
-                })();
-                if let Some(data) = initial_screen {
-                    loom_core::log_debug!(self.log, "dispatch",
-                        "initial full redraw ({} bytes)", data.len());
-                    let _ = self.send_to(token, &Message::ScreenUpdate { data });
-                }
-                // Ensure tty exists
-                if let Some(client) = self.clients.get_mut(&token) {
-                    if !client.tty_initialized {
-                        let sx = client.pending_size.map(|s| s.0).unwrap_or(80);
-                        let sy = client.pending_size.map(|s| s.1).unwrap_or(24);
-                        client.tty = Some(Tty::new(sx, sy));
-                        client.tty_initialized = true;
+                    // Initial full-screen render.
+                    if let Some(wid) = wid {
+                        self.redraw_for_client(token, wid, true);
                     }
-                    client.attached = true;
                 }
             }
             Message::KeyPress { key } => {
@@ -810,9 +827,10 @@ impl Server {
                                 if let Some(window) = self.windows.get(&wl.window_id) {
                                     if let Some(active_pane_id) = window.active_pane_id {
                                         if let Some(pane) = window.panes.get(&active_pane_id) {
-                    if let Some(pfd) = pane.fd {
-                                            let bfd = unsafe { BorrowedFd::borrow_raw(pfd) };
-                                            let _ = nix::unistd::write(&bfd, &key);
+                                            if let Some(pfd) = pane.fd {
+                                                let bfd =
+                                                    unsafe { BorrowedFd::borrow_raw(pfd) };
+                                                let _ = nix::unistd::write(&bfd, &key);
                                             }
                                         }
                                     }
@@ -823,17 +841,705 @@ impl Server {
                 }
             }
             Message::Exit => {
-                let token_copy = token;
-                if let Some(client) = self.clients.get(&token_copy) {
-                    if let Some(sid) = client.session_id {
-                        self.sessions.remove(&sid);
-                    }
-                }
-                self.clients.remove(&token_copy);
+                // Client is going away. The session persists (P0-6).
+                loom_core::log_debug!(self.log, "dispatch", "Exit from token={:?}", token);
+                self.clients.remove(&token);
             }
             _ => {}
         }
         Ok(())
+    }
+
+    /// Run an interactive command (new-session, split-window, ...).
+    ///
+    /// Dispatches through a static command registry instead of a monolithic
+    /// match (B2). Adding a command means adding one `cmd_*` method and one
+    /// registry entry — no edits to this method.
+    fn handle_command(&mut self, token: Token, argv: &[String]) -> io::Result<()> {
+        if argv.is_empty() {
+            return Ok(());
+        }
+        let name = argv[0].as_str();
+        let args = &argv[1..];
+        match Self::command_registry().get(name) {
+            Some(&handler) => handler(self, token, args),
+            None => {
+                loom_core::log_info!(
+                    self.log,
+                    "cmd",
+                    "unknown command: {}",
+                    name
+                );
+                Ok(())
+            }
+        }
+    }
+
+    /// Command dispatch table: maps command names and aliases to handlers.
+    /// Built once, lazily, via `OnceLock`.
+    fn command_registry() -> &'static HashMap<&'static str, CommandHandler> {
+        static REGISTRY: OnceLock<HashMap<&'static str, CommandHandler>> = OnceLock::new();
+        REGISTRY.get_or_init(|| {
+            let mut m: HashMap<&'static str, CommandHandler> = HashMap::new();
+            // Sessions
+            m.insert("new-session", Self::cmd_new_session);
+            m.insert("new", Self::cmd_new_session);
+            m.insert("kill-session", Self::cmd_kill_session);
+            m.insert("list-sessions", Self::cmd_list_sessions);
+            m.insert("ls", Self::cmd_list_sessions);
+            m.insert("select-session", Self::cmd_select_session);
+            m.insert("attach-session", Self::cmd_select_session);
+            m.insert("attach", Self::cmd_select_session);
+            // Windows
+            m.insert("new-window", Self::cmd_new_window);
+            m.insert("neww", Self::cmd_new_window);
+            m.insert("kill-window", Self::cmd_kill_window);
+            m.insert("select-window", Self::cmd_select_window);
+            m.insert("list-windows", Self::cmd_list_windows);
+            m.insert("lsw", Self::cmd_list_windows);
+            // Panes
+            m.insert("split-window", Self::cmd_split_window);
+            m.insert("split", Self::cmd_split_window);
+            m.insert("select-pane", Self::cmd_select_pane);
+            m.insert("resize-pane", Self::cmd_resize_pane);
+            m.insert("kill-pane", Self::cmd_kill_pane);
+            m.insert("swap-pane", Self::cmd_swap_pane);
+            m.insert("list-panes", Self::cmd_list_panes);
+            m.insert("lsp", Self::cmd_list_panes);
+            // Client / introspection
+            m.insert("list-clients", Self::cmd_list_clients);
+            m.insert("show-options", Self::cmd_show_options);
+            m.insert("run-shell", Self::cmd_run_shell);
+            m
+        })
+    }
+
+    // ── Command handlers ──────────────────────────────────────────────
+    // Each handler is a plain method; the registry in `command_registry`
+    // routes by name. Args are the argv with the command name removed.
+
+    fn cmd_new_session(&mut self, token: Token, _args: &[String]) -> io::Result<()> {
+        loom_core::log_info!(self.log, "dispatch", "creating new session");
+        let cwd = self
+            .clients
+            .get(&token)
+            .map(|c| c.cwd.clone())
+            .unwrap_or_else(|| "/tmp".to_string());
+        let (sx, sy) = self
+            .clients
+            .get(&token)
+            .and_then(|c| c.pending_size)
+            .unwrap_or((80, 24));
+        loom_core::log_debug!(self.log, "dispatch", "window size: {}x{}", sx, sy);
+
+        let csy = content_sy(sy); // reserve the status row (B3)
+        let mut session = Session::new(None, &cwd);
+        let window = Window::new(sx, csy);
+        let wid = window.id;
+        let sid = session.id;
+
+        self.windows.insert(wid, window);
+        let _pane_id = self.spawn_pane(wid, sx, csy, &cwd);
+
+        session.attach_window(0, wid);
+        self.sessions.insert(sid, session);
+
+        if let Some(client) = self.clients.get_mut(&token) {
+            client.session_id = Some(sid);
+        }
+        Ok(())
+    }
+
+    fn cmd_kill_session(&mut self, token: Token, _args: &[String]) -> io::Result<()> {
+        if let Some(client) = self.clients.get(&token) {
+            if let Some(sid) = client.session_id {
+                self.kill_session(sid);
+                if let Some(c) = self.clients.get_mut(&token) {
+                    c.session_id = None;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn cmd_list_sessions(&mut self, token: Token, _args: &[String]) -> io::Result<()> {
+        let names: Vec<String> = self
+            .sessions
+            .values()
+            .map(|s| format!("{}: {} windows", s.name, s.windows.len()))
+            .collect();
+        let response = names.join("\n");
+        self.send_to(
+            token,
+            &Message::Command {
+                argc: 0,
+                argv: vec![";".into(), response],
+            },
+        )?;
+        Ok(())
+    }
+
+    fn cmd_select_session(&mut self, token: Token, args: &[String]) -> io::Result<()> {
+        // Point the client at a session so it can attach: explicit name (or
+        // id), else the most recent session. Replies `OK` or `no-session`
+        // so the client can fall back to `new-session`.
+        let target = args.first().map(|s| s.as_str());
+        let sid = match target {
+            Some(t) => self
+                .sessions
+                .values()
+                .find(|s| s.name == t || s.id.to_string() == t)
+                .map(|s| s.id),
+            None => self.sessions.keys().max().copied(),
+        };
+        match sid {
+            Some(sid) => {
+                if let Some(client) = self.clients.get_mut(&token) {
+                    client.session_id = Some(sid);
+                }
+                self.send_to(
+                    token,
+                    &Message::Command {
+                        argc: 0,
+                        argv: vec![";".into(), "OK".into()],
+                    },
+                )?;
+            }
+            None => {
+                self.send_to(
+                    token,
+                    &Message::Command {
+                        argc: 0,
+                        argv: vec![";".into(), "no-session".into()],
+                    },
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    fn cmd_new_window(&mut self, token: Token, _args: &[String]) -> io::Result<()> {
+        self.do_new_window(token)
+    }
+
+    fn cmd_split_window(&mut self, token: Token, args: &[String]) -> io::Result<()> {
+        let vertical = args.iter().any(|a| a == "-v");
+        self.do_split_window(token, vertical)
+    }
+
+    fn cmd_kill_window(&mut self, token: Token, _args: &[String]) -> io::Result<()> {
+        if let Some(client) = self.clients.get(&token) {
+            if let Some(sid) = client.session_id {
+                if let Some(session) = self.sessions.get(&sid) {
+                    if let Some(wl) = session.current_winlink() {
+                        let wid = wl.window_id;
+                        self.kill_window(wid);
+                        if let Some(s) = self.sessions.get_mut(&sid) {
+                            let idx = s
+                                .windows
+                                .iter()
+                                .find(|(_, w)| w.window_id == wid)
+                                .map(|(i, _)| *i);
+                            if let Some(i) = idx {
+                                s.detach_window(i);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn cmd_select_window(&mut self, token: Token, args: &[String]) -> io::Result<()> {
+        // Targets: "N", "-n" (next), "-p" (previous).
+        let target = if args.iter().any(|a| a == "-n") {
+            "next"
+        } else if args.iter().any(|a| a == "-p") {
+            "prev"
+        } else {
+            "index"
+        };
+        if let Some(client) = self.clients.get(&token) {
+            if let Some(sid) = client.session_id {
+                if let Some(session) = self.sessions.get(&sid) {
+                    let count = i32::try_from(session.windows.len()).unwrap_or(0);
+                    if count > 0 {
+                        let cur = session.curw_idx.unwrap_or(0);
+                        let idx = match target {
+                            "next" => (cur + 1).rem_euclid(count),
+                            "prev" => (cur - 1).rem_euclid(count),
+                            _ => args.iter().find_map(|a| a.parse::<i32>().ok()).unwrap_or(cur),
+                        };
+                        let valid = session.windows.contains_key(&idx);
+                        if valid {
+                            if let Some(session) = self.sessions.get_mut(&sid) {
+                                session.set_current_window(idx);
+                                // Visiting a window clears its alert flags.
+                                for wl in session.windows.values_mut() {
+                                    wl.flags &= !WINLINK_ALERTFLAGS;
+                                }
+                            }
+                            if let Some(wl) = self
+                                .sessions
+                                .get(&sid)
+                                .and_then(|s| s.current_winlink())
+                            {
+                                let wid = wl.window_id;
+                                if let Some(w) = self.windows.get_mut(&wid) {
+                                    w.flags &= !(WINDOW_BELL | WINDOW_ACTIVITY);
+                                }
+                                self.broadcast_redraw(sid, wid, true);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn cmd_select_pane(&mut self, token: Token, args: &[String]) -> io::Result<()> {
+        // Targets: a pane index, or a direction -L/-R/-U/-D.
+        let dir = match args.first().map(|s| s.as_str()) {
+            Some("-L") => Some("L"),
+            Some("-R") => Some("R"),
+            Some("-U") => Some("U"),
+            Some("-D") => Some("D"),
+            _ => None,
+        };
+        if let Some(client) = self.clients.get(&token) {
+            if let Some(sid) = client.session_id {
+                if let Some(session) = self.sessions.get(&sid) {
+                    if let Some(wl) = session.current_winlink() {
+                        let wid = wl.window_id;
+                        if let Some(window) = self.windows.get_mut(&wid) {
+                            let target_pid = match dir {
+                                Some(d) => pane_in_direction(window, d),
+                                None => args
+                                    .first()
+                                    .and_then(|s| s.parse::<usize>().ok())
+                                    .and_then(|n| window.pane_order.get(n).copied()),
+                            };
+                            if let Some(pid) = target_pid {
+                                window.set_active_pane(pid);
+                            }
+                        }
+                        self.broadcast_redraw(sid, wid, false);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn cmd_resize_pane(&mut self, token: Token, args: &[String]) -> io::Result<()> {
+        // -Z toggles zoom (B1): the active pane fills the whole window.
+        if !args.iter().any(|a| a == "-Z") {
+            return Ok(());
+        }
+        if let Some(client) = self.clients.get(&token) {
+            if let Some(sid) = client.session_id {
+                if let Some(session) = self.sessions.get(&sid) {
+                    if let Some(wl) = session.current_winlink() {
+                        let wid = wl.window_id;
+                        let pid = self.windows.get(&wid).and_then(|w| w.active_pane_id);
+                        if let Some(pid) = pid {
+                            let zoomed = {
+                                let mut ok = false;
+                                if let Some(w) = self.windows.get_mut(&wid) {
+                                    ok = layout::layout_zoom(w, pid);
+                                }
+                                ok
+                            };
+                            if zoomed {
+                                // Reflow the PTY to the new pane size.
+                                if let Some((px, py, pfd)) = self
+                                    .windows
+                                    .get(&wid)
+                                    .and_then(|w| w.panes.get(&pid))
+                                    .map(|p| (p.sx, p.sy, p.fd))
+                                {
+                                    if let Some(fd) = pfd {
+                                        set_pty_size(fd, px, py);
+                                    }
+                                }
+                                self.broadcast_redraw(sid, wid, true);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn cmd_kill_pane(&mut self, token: Token, _args: &[String]) -> io::Result<()> {
+        if let Some(client) = self.clients.get(&token) {
+            if let Some(sid) = client.session_id {
+                if let Some(session) = self.sessions.get(&sid) {
+                    if let Some(wl) = session.current_winlink() {
+                        let wid = wl.window_id;
+                        if let Some(window) = self.windows.get(&wid) {
+                            if let Some(pid) = window.active_pane_id {
+                                let (ppid, pfd) = match window.panes.get(&pid) {
+                                    Some(p) => (p.pid, p.fd),
+                                    None => (None, None),
+                                };
+                                self.close_pane_process(pid, ppid, pfd);
+                                if let Some(w) = self.windows.get_mut(&wid) {
+                                    w.remove_pane(pid);
+                                }
+                                self.broadcast_redraw(sid, wid, false);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn cmd_list_windows(&mut self, token: Token, _args: &[String]) -> io::Result<()> {
+        if let Some(client) = self.clients.get(&token) {
+            if let Some(sid) = client.session_id {
+                if let Some(session) = self.sessions.get(&sid) {
+                    let lines: Vec<String> = session
+                        .windows
+                        .iter()
+                        .map(|(idx, wl)| {
+                            let active = session.curw_idx == Some(*idx);
+                            let marker = if active { "*" } else { " " };
+                            let name = self
+                                .windows
+                                .get(&wl.window_id)
+                                .map(|w| w.name.as_str())
+                                .unwrap_or("unnamed");
+                            format!("{}{}: {}", marker, idx, name)
+                        })
+                        .collect();
+                    let response = lines.join("\n");
+                    self.send_to(
+                        token,
+                        &Message::Command {
+                            argc: 0,
+                            argv: vec![";".into(), response],
+                        },
+                    )?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn cmd_list_panes(&mut self, token: Token, _args: &[String]) -> io::Result<()> {
+        if let Some(client) = self.clients.get(&token) {
+            if let Some(sid) = client.session_id {
+                if let Some(session) = self.sessions.get(&sid) {
+                    if let Some(wl) = session.current_winlink() {
+                        let wid = wl.window_id;
+                        if let Some(window) = self.windows.get(&wid) {
+                            let lines: Vec<String> = window
+                                .pane_order
+                                .iter()
+                                .map(|pid| {
+                                    let active = window.active_pane_id == Some(*pid);
+                                    let marker = if active { "*" } else { " " };
+                                    let pane = window.panes.get(pid);
+                                    format!(
+                                        "{}%{}: {} ({}x{})",
+                                        marker,
+                                        pid,
+                                        pane.map(|p| p.shell.as_str()).unwrap_or("unknown"),
+                                        pane.map(|p| p.sx).unwrap_or(0),
+                                        pane.map(|p| p.sy).unwrap_or(0)
+                                    )
+                                })
+                                .collect();
+                            let response = lines.join("\n");
+                            self.send_to(
+                                token,
+                                &Message::Command {
+                                    argc: 0,
+                                    argv: vec![";".into(), response],
+                                },
+                            )?;
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn cmd_swap_pane(&mut self, token: Token, args: &[String]) -> io::Result<()> {
+        // -s source-pane, -t destination-pane (by pane id).
+        let mut src: Option<PaneId> = None;
+        let mut dst: Option<PaneId> = None;
+        let mut i = 0;
+        while i < args.len() {
+            match args[i].as_str() {
+                "-s" if i + 1 < args.len() => {
+                    if let Ok(pid) = args[i + 1].parse::<u32>() {
+                        src = Some(pid);
+                    }
+                    i += 2;
+                }
+                "-t" if i + 1 < args.len() => {
+                    if let Ok(pid) = args[i + 1].parse::<u32>() {
+                        dst = Some(pid);
+                    }
+                    i += 2;
+                }
+                _ => i += 1,
+            }
+        }
+        if let (Some(s), Some(d)) = (src, dst) {
+            if let Some(client) = self.clients.get(&token) {
+                if let Some(sid) = client.session_id {
+                    if let Some(session) = self.sessions.get(&sid) {
+                        if let Some(wl) = session.current_winlink() {
+                            let wid = wl.window_id;
+                            let swapped = {
+                                let window = match self.windows.get_mut(&wid) {
+                                    Some(w) => w,
+                                    None => return Ok(()),
+                                };
+                                let (sc, dc) = match (
+                                    window.panes.get(&s).and_then(|p| p.layout_cell),
+                                    window.panes.get(&d).and_then(|p| p.layout_cell),
+                                ) {
+                                    (Some(sc), Some(dc)) => (sc, dc),
+                                    _ => return Ok(()),
+                                };
+                                let tmp = window.cells[sc].pane_id;
+                                window.cells[sc].pane_id = window.cells[dc].pane_id;
+                                window.cells[dc].pane_id = tmp;
+                                if let Some(p) = window.panes.get_mut(&s) {
+                                    p.layout_cell = Some(dc);
+                                }
+                                if let Some(p) = window.panes.get_mut(&d) {
+                                    p.layout_cell = Some(sc);
+                                }
+                                layout::fix_layout_panes(window);
+                                true
+                            };
+                            if swapped {
+                                self.broadcast_redraw(sid, wid, false);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn cmd_list_clients(&mut self, token: Token, _args: &[String]) -> io::Result<()> {
+        let lines: Vec<String> = self
+            .clients
+            .iter()
+            .map(|(t, c)| {
+                let sid = c.session_id.map(|id| id.to_string()).unwrap_or_else(|| "-".to_string());
+                format!(
+                    "client {:?} session={} term={} attached={}",
+                    t,
+                    sid,
+                    c.term_name,
+                    c.attached
+                )
+            })
+            .collect();
+        let response = lines.join("\n");
+        self.send_to(
+            token,
+            &Message::Command {
+                argc: 0,
+                argv: vec![";".into(), response],
+            },
+        )?;
+        Ok(())
+    }
+
+    fn cmd_show_options(&mut self, token: Token, _args: &[String]) -> io::Result<()> {
+        if let Some(client) = self.clients.get(&token) {
+            if let Some(sid) = client.session_id {
+                if let Some(session) = self.sessions.get(&sid) {
+                    let lines: Vec<String> = session
+                        .options
+                        .iter()
+                        .map(|e| format!("{} \"{:?}\"", e.name, e.value))
+                        .collect();
+                    let response = lines.join("\n");
+                    self.send_to(
+                        token,
+                        &Message::Command {
+                            argc: 0,
+                            argv: vec![";".into(), response],
+                        },
+                    )?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Run a shell command and send its combined output back to the caller.
+    /// Basic form for B2; full control-mode semantics are P2.
+    fn cmd_run_shell(&mut self, token: Token, args: &[String]) -> io::Result<()> {
+        if args.is_empty() {
+            self.send_to(
+                token,
+                &Message::Command {
+                    argc: 0,
+                    argv: vec![";".into(), "usage: run-shell <command>".into()],
+                },
+            )?;
+            return Ok(());
+        }
+        let cmd = args.join(" ");
+        let output = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(&cmd)
+            .output();
+        let response = match output {
+            Ok(o) => {
+                let mut s = String::from_utf8_lossy(&o.stdout).into_owned();
+                let err = String::from_utf8_lossy(&o.stderr);
+                if !err.is_empty() {
+                    s.push_str("\n");
+                    s.push_str(&err);
+                }
+                s
+            }
+            Err(e) => format!("run-shell failed: {}", e),
+        };
+        self.send_to(
+            token,
+            &Message::Command {
+                argc: 0,
+                argv: vec![";".into(), response],
+            },
+        )?;
+        Ok(())
+    }
+
+    fn do_split_window(&mut self, token: Token, vertical: bool) -> io::Result<()> {
+        if let Some(client) = self.clients.get(&token) {
+            if let Some(sid) = client.session_id {
+                if let Some(session) = self.sessions.get(&sid) {
+                    if let Some(wl) = session.current_winlink() {
+                        let wid = wl.window_id;
+
+                        // Snapshot active pane info (ends borrows before mutation).
+                        let (active_pane_id, cwd, (sx, sy)) = {
+                            let window = match self.windows.get(&wid) {
+                                Some(w) => w,
+                                None => return Ok(()),
+                            };
+                            let active = match window.active_pane_id {
+                                Some(a) => a,
+                                None => return Ok(()),
+                            };
+                            let cwd = window
+                                .panes
+                                .get(&active)
+                                .map(|p| p.cwd.clone())
+                                .unwrap_or_else(|| "/".to_string());
+                            let (sx, sy) = window
+                                .panes
+                                .get(&active)
+                                .map(|p| (p.sx, p.sy))
+                                .unwrap_or((window.sx, window.sy));
+                            (active, cwd, (sx, sy))
+                        };
+
+                        // Split the layout (P0-8: the new pane gets a real shell).
+                        let new_pane = self
+                            .windows
+                            .get_mut(&wid)
+                            .and_then(|window| layout::layout_split_pane(window, active_pane_id, vertical));
+
+                        if let Some(pid) = new_pane {
+                            if let Some(window) = self.windows.get_mut(&wid) {
+                                window.set_active_pane(pid);
+                            }
+                            self.spawn_pane_in(wid, pid, sx, sy, &cwd);
+                        }
+                        self.broadcast_redraw(sid, wid, false);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn do_new_window(&mut self, token: Token) -> io::Result<()> {
+        if let Some(client) = self.clients.get(&token) {
+            if let Some(sid) = client.session_id {
+                if let Some(session) = self.sessions.get(&sid) {
+                    if let Some(wl) = session.current_winlink() {
+                        let wid = wl.window_id;
+                        let (sx, sy) = self
+                            .windows
+                            .get(&wid)
+                            .map(|w| (w.sx, w.sy))
+                            .unwrap_or((80, 24));
+                        let cwd = self.clients.get(&token).map(|c| c.cwd.clone()).unwrap_or_else(|| "/".into());
+                        let window = Window::new(sx, sy);
+                        let new_wid = window.id;
+                        self.windows.insert(new_wid, window);
+                        self.spawn_pane(new_wid, sx, sy, &cwd);
+                        if let Some(session) = self.sessions.get_mut(&sid) {
+                            let next_idx = session.windows.keys().max().map(|i| i + 1).unwrap_or(0);
+                            session.attach_window(next_idx, new_wid);
+                            session.set_current_window(next_idx);
+                        }
+                        self.broadcast_redraw(sid, new_wid, true);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Spawn a shell into an already-created pane (used by split-window).
+    fn spawn_pane_in(&mut self, wid: WindowId, pane_id: PaneId, sx: u32, sy: u32, cwd: &str) -> Option<RawFd> {
+        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+        match spawner::spawn_pty(&[shell.clone()], cwd, sx, sy) {
+            Ok((child_pid, master_fd)) => {
+                let pid = child_pid.as_raw() as u32;
+                let _ = nix::fcntl::fcntl(
+                    master_fd,
+                    nix::fcntl::FcntlArg::F_SETFL(nix::fcntl::OFlag::O_NONBLOCK),
+                );
+                let pty_token = Token(PTY_BASE + self.next_pty_token);
+                self.next_pty_token += 1;
+                let mut source = SourceFd(&master_fd);
+                if self
+                    .poll
+                    .registry()
+                    .register(&mut source, pty_token, Interest::READABLE)
+                    .is_ok()
+                {
+                    self.pty_fds.insert(pty_token, (master_fd, pane_id));
+                }
+                self.parsers.insert(pane_id, Parser::new());
+                if let Some(window) = self.windows.get_mut(&wid) {
+                    if let Some(pane) = window.panes.get_mut(&pane_id) {
+                        pane.fd = Some(master_fd);
+                        pane.pid = Some(pid);
+                        pane.shell = shell;
+                        pane.cwd = cwd.to_string();
+                    }
+                }
+                Some(master_fd)
+            }
+            Err(e) => {
+                loom_core::log_error!(self.log, "spawn_in", "spawn_pty FAILED: {}", e);
+                None
+            }
+        }
     }
 
     fn send_to(&mut self, token: Token, msg: &Message) -> io::Result<()> {
@@ -852,12 +1558,137 @@ impl Server {
     }
 }
 
+/// Set a PTY's window size via TIOCSWINSZ.
+fn set_pty_size(fd: RawFd, sx: u32, sy: u32) {
+    let ws = nix::libc::winsize {
+        ws_row: sy as u16,
+        ws_col: sx as u16,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    unsafe {
+        nix::libc::ioctl(fd, nix::libc::TIOCSWINSZ, &ws);
+    }
+}
+
+/// (B3) Build the status-line segments for session `sid`, window `wid`.
+/// Left: session name. Middle: window list (active inverted, alerts starred).
+fn status_segments(
+    sessions: &HashMap<SessionId, Session>,
+    windows: &HashMap<WindowId, Window>,
+    sid: SessionId,
+    wid: WindowId,
+) -> Vec<(String, redraw::StatusStyle)> {
+    let mut segs: Vec<(String, redraw::StatusStyle)> = Vec::new();
+    let session = match sessions.get(&sid) {
+        Some(s) => s,
+        None => return segs,
+    };
+
+    let name = if session.name.is_empty() {
+        sid.to_string()
+    } else {
+        session.name.clone()
+    };
+    segs.push((format!(" {} ", name), redraw::StatusStyle::Normal));
+
+    let cur = session.curw_idx;
+    for (idx, wl) in &session.windows {
+        // Active = this client's current window (per-client view), falling
+        // back to the session's current window index.
+        let active = wl.window_id == wid || cur == Some(*idx);
+        let alerted = wl.flags & WINLINK_ALERTFLAGS != 0 && !active;
+        let wname = window_display_name(windows, wl.window_id);
+        let prefix = if alerted { "*" } else { "" };
+        let style = if active {
+            redraw::StatusStyle::Active
+        } else if alerted {
+            redraw::StatusStyle::Alert
+        } else {
+            redraw::StatusStyle::Normal
+        };
+        segs.push((format!(" {}:{}{} ", idx, prefix, wname), style));
+    }
+    segs
+}
+
+/// Human-readable name for a window: OSC title, else the active pane's
+/// shell basename, else "shell".
+fn window_display_name(windows: &HashMap<WindowId, Window>, wid: WindowId) -> String {
+    let window = match windows.get(&wid) {
+        Some(w) => w,
+        None => return "shell".into(),
+    };
+    if !window.name.is_empty() {
+        return window.name.clone();
+    }
+    if let Some(pid) = window.active_pane_id {
+        if let Some(pane) = window.panes.get(&pid) {
+            if !pane.shell.is_empty() {
+                if let Some(base) = pane.shell.rsplit('/').next() {
+                    if !base.is_empty() {
+                        return base.to_string();
+                    }
+                }
+            }
+        }
+    }
+    "shell".into()
+}
+
+/// Find the pane to select when moving in direction `dir` from the active
+/// pane: the nearest pane strictly in that direction.
+fn pane_in_direction(window: &Window, dir: &str) -> Option<PaneId> {
+    let active = window.active_pane_id?;
+    let a = window.panes.get(&active)?;
+    let mut best: Option<(PaneId, i32)> = None;
+    for (pid, p) in &window.panes {
+        if *pid == active {
+            continue;
+        }
+        let dx = p.xoff - a.xoff;
+        let dy = p.yoff - a.yoff;
+        let (ok, dist) = match dir {
+            "L" => (dx < 0, -dx + dy.abs()),
+            "R" => (dx > 0, dx + dy.abs()),
+            "U" => (dy < 0, -dy + dx.abs()),
+            "D" => (dy > 0, dy + dx.abs()),
+            _ => (false, 0),
+        };
+        if ok && best.map(|(_, d)| dist < d).unwrap_or(true) {
+            best = Some((*pid, dist));
+        }
+    }
+    best.map(|(pid, _)| pid)
+}
+
+/// Kill a process and its group. The child called `setsid()` so its pid is
+/// the process-group id; SIGKILL to the group takes down its children too.
+fn kill_process_group(pid: u32) {
+    let pid = pid as i32;
+    unsafe {
+        nix::libc::kill(-pid, nix::libc::SIGKILL);
+        nix::libc::kill(pid, nix::libc::SIGKILL);
+    }
+    let mut status: i32 = 0;
+    unsafe {
+        nix::libc::waitpid(pid, &mut status, 0);
+    }
+}
+
 impl Drop for Server {
     fn drop(&mut self) {
-        if let Some(fd) = self.listen_fd {
-            unsafe { nix::libc::close(fd); }
+        // Kill all panes' processes before dropping.
+        let panes: Vec<(PaneId, Option<u32>, Option<RawFd>)> = self
+            .windows
+            .values()
+            .flat_map(|w| w.panes.values().map(|p| (p.id, p.pid, p.fd)))
+            .collect();
+        for (pane_id, pid, fd) in panes {
+            self.close_pane_process(pane_id, pid, fd);
         }
-        // Clean up socket file
+        // Dropping the listener closes the socket fd; remove the socket file.
+        self.listener = None;
         let _ = std::fs::remove_file(&self.config.socket_path);
     }
 }
@@ -865,7 +1696,6 @@ impl Drop for Server {
 #[cfg(test)]
 mod tests {
     use super::*;
-
 
     #[test]
     fn test_server_create() {

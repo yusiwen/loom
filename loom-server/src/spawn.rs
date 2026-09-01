@@ -75,7 +75,7 @@ pub fn spawn_pty(
             // Create a new session and set controlling TTY
             unsafe {
                 nix::libc::setsid();
-                nix::libc::ioctl(slave, nix::libc::TIOCSCTTY, 0);
+                nix::libc::ioctl(slave, nix::libc::TIOCSCTTY as nix::libc::c_ulong, 0);
             }
 
             // Duplicate slave fd to stdin/stdout/stderr
@@ -140,7 +140,18 @@ mod tests {
 
     #[test]
     fn test_spawn_pty_shell() {
-        // Just test that spawn works, don't wait for it
+        // Skip in sandboxes that deny pty allocation.
+        let master = unsafe { nix::libc::posix_openpt(nix::libc::O_RDWR) };
+        if master < 0 {
+            eprintln!(
+                "SKIP test_spawn_pty_shell: pty allocation unavailable ({:?})",
+                std::io::Error::last_os_error()
+            );
+            return;
+        }
+        unsafe { nix::libc::close(master); }
+
+        // Spawn a real PTY shell and verify it starts.
         match spawn_pty(&["true".into()], "/tmp", 80, 24) {
             Ok((pid, master_fd)) => {
                 assert!(pid.as_raw() > 0);
@@ -149,10 +160,7 @@ mod tests {
                 nix::sys::wait::waitpid(pid, None).unwrap();
                 unsafe { nix::libc::close(master_fd) };
             }
-            Err(e) => {
-                // May fail in test environments without PTY
-                eprintln!("spawn_pty failed: {}", e);
-            }
+            Err(e) => panic!("spawn_pty failed: {}", e),
         }
     }
 }

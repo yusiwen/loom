@@ -9,6 +9,9 @@ pub const GRID_FLAG_NOPALETTE: u8 = 0x20;
 pub const GRID_FLAG_CLEARED: u8 = 0x40;
 pub const GRID_FLAG_TAB: u8 = 0x80;
 
+/// Grid flag: scrolling / history is enabled for this grid.
+pub const GRID_FLAG_HISTORY: u16 = 0x100;
+
 pub const GRID_LINE_WRAPPED: u8 = 0x01;
 pub const GRID_LINE_EXTENDED: u8 = 0x02;
 pub const GRID_LINE_DEAD: u8 = 0x04;
@@ -38,7 +41,7 @@ pub const GRID_ATTR_ALL_UNDERSCORE: u16 = GRID_ATTR_UNDERSCORE
     | GRID_ATTR_UNDERSCORE_4
     | GRID_ATTR_UNDERSCORE_5;
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug)]
 pub struct GridCell {
     pub data: Utf8Data,
     pub attr: u16,
@@ -49,8 +52,14 @@ pub struct GridCell {
     pub link: u32,
 }
 
+impl Default for GridCell {
+    fn default() -> Self {
+        Self::default_cell()
+    }
+}
+
 impl GridCell {
-    pub fn default_cell() -> Self {
+    pub const fn default_cell() -> Self {
         Self {
             data: Utf8Data::space(),
             attr: 0,
@@ -97,6 +106,10 @@ impl GridCell {
         !self.is_padding() && !self.is_cleared()
     }
 }
+
+/// The default cell returned for unwritten screen positions (blank, default
+/// colours). Keeps `get_cell`/`view_get_cell` total instead of `None`.
+static DEFAULT_CELL: GridCell = GridCell::default_cell();
 
 #[derive(Clone, Copy, Debug)]
 pub struct GridExtdEntry {
@@ -163,7 +176,7 @@ impl Default for GridLine {
 
 #[derive(Clone, Debug)]
 pub struct Grid {
-    pub flags: u8,
+    pub flags: u16,
     pub sx: u32,
     pub sy: u32,
     pub hscrolled: u32,
@@ -180,7 +193,7 @@ impl Grid {
             linedata.push(GridLine::new());
         }
         Self {
-            flags: 0,
+            flags: GRID_FLAG_HISTORY,
             sx,
             sy,
             hscrolled: 0,
@@ -220,7 +233,8 @@ impl Grid {
 
     pub fn get_cell(&self, x: u32, y: u32) -> Option<&GridCell> {
         let line = self.get_line(y)?;
-        line.cells.get(x as usize)
+        // Unwritten cells read back as the default blank cell (tmux semantics).
+        line.cells.get(x as usize).or(Some(&DEFAULT_CELL))
     }
 
     pub fn get_cell_mut(&mut self, x: u32, y: u32) -> Option<&mut GridCell> {
@@ -241,40 +255,35 @@ impl Grid {
         }
     }
 
-    pub fn scroll_history(&mut self) {
-        if self.flags & 1 == 0 {
+    /// Scroll the entire visible area up by one line.
+    /// The top visible line moves into history; a blank line appears at the bottom.
+    pub fn scroll_up(&mut self) {
+        if self.flags & GRID_FLAG_HISTORY == 0 {
             return;
         }
-        let mut new_line = GridLine::new();
-        new_line.flags |= GRID_LINE_WRAPPED;
+        let new_line = GridLine::new();
         self.linedata.push(new_line);
         self.hsize += 1;
         self.collect_history();
     }
 
-    pub fn scroll_history_region(&mut self, rupper: u32, rlower: u32) {
-        if self.flags & 1 == 0 {
-            return;
-        }
+    /// Scroll within a sub-region [rupper, rlower].
+    /// The top line of the region is lost; a blank line appears at the bottom.
+    pub fn scroll_region_up(&mut self, rupper: u32, rlower: u32) {
         if rupper >= rlower {
             return;
         }
         let top = (self.hsize + rupper) as usize;
         let bot = (self.hsize + rlower) as usize;
         let len = self.linedata.len();
-        if top >= bot || top >= len {
+        if top >= len || bot >= len {
             return;
         }
+        // Remove the top line of the region
         self.linedata.remove(top);
-        let mut new_line = GridLine::new();
-        new_line.flags |= GRID_LINE_WRAPPED;
-        if bot <= len {
-            self.linedata.insert(bot, new_line);
-        } else {
-            self.linedata.push(new_line);
-        }
-        self.hsize += 1;
-        self.collect_history();
+        // Insert a blank line at the bottom of the region
+        let insert_at = bot.min(self.linedata.len());
+        self.linedata.insert(insert_at, GridLine::new());
     }
 
     pub fn collect_history(&mut self) {
@@ -315,6 +324,120 @@ impl Grid {
     pub fn view_set_cell(&mut self, x: u32, y: u32, gc: &GridCell) {
         if let Some(cell) = self.view_get_cell_mut(x, y) {
             *cell = *gc;
+        }
+    }
+
+    /// Set or clear the WRAPPED flag on a visible line.
+    pub fn set_line_wrapped(&mut self, view_y: u32, wrapped: bool) {
+        if let Some(line) = self.get_line_mut(self.view_line(view_y)) {
+            line.set_wrapped(wrapped);
+        }
+    }
+
+    /// ICH: Insert *n* blank cells at (x, view_y), shifting cells right.
+    pub fn insert_chars(&mut self, x: u32, view_y: u32, n: u32) {
+        if view_y >= self.sy || n == 0 {
+            return;
+        }
+        let sx = self.sx as usize;
+        let x = (x as usize).min(sx);
+        let n = (n as usize).min(sx.saturating_sub(x));
+        let idx = self.view_line(view_y);
+        let line = match self.get_line_mut(idx) { Some(l) => l, None => return };
+        // Extend line if needed
+        while line.cells.len() < sx {
+            line.cells.push(GridCell::default_cell());
+        }
+        for i in (x..sx).rev() {
+            if i >= x + n {
+                line.cells[i] = line.cells[i - n];
+            } else {
+                line.cells[i] = GridCell::default_cell();
+            }
+        }
+        line.cellused = sx as u32;
+    }
+
+    /// DCH: Delete *n* cells at (x, view_y), shifting cells left.
+    pub fn delete_chars(&mut self, x: u32, view_y: u32, n: u32) {
+        if view_y >= self.sy || n == 0 {
+            return;
+        }
+        let sx = self.sx as usize;
+        let x = (x as usize).min(sx);
+        let n = (n as usize).min(sx.saturating_sub(x));
+        let idx = self.view_line(view_y);
+        let line = match self.get_line_mut(idx) { Some(l) => l, None => return };
+        while line.cells.len() < sx {
+            line.cells.push(GridCell::default_cell());
+        }
+        for i in 0..(sx - n) {
+            let src = i + n;
+            if src < sx {
+                line.cells[i] = line.cells[src];
+            } else {
+                line.cells[i] = GridCell::default_cell();
+            }
+        }
+        line.cellused = sx as u32;
+    }
+
+    /// ECH: Erase *n* cells starting at (x, view_y).
+    pub fn erase_chars(&mut self, x: u32, view_y: u32, n: u32) {
+        if view_y >= self.sy {
+            return;
+        }
+        let dx = x.saturating_add(n).min(self.sx);
+        for xx in x..dx {
+            self.view_set_cell(xx, view_y, &GridCell::default_cell());
+        }
+    }
+
+    /// IL: Insert *n* blank lines at view_y, within scroll region [top, bottom].
+    pub fn insert_lines(&mut self, top: u32, bottom: u32, view_y: u32, n: u32) {
+        if n == 0 || view_y < top || view_y > bottom || top > bottom {
+            return;
+        }
+        let n = n.min(bottom - view_y + 1);
+        let ti = (self.hsize + top) as usize;
+        let bi = (self.hsize + bottom) as usize;
+        if bi >= self.linedata.len() {
+            return;
+        }
+        let region_len = (bottom - top + 1) as usize;
+        let mut region: Vec<GridLine> = self.linedata[ti..=bi].to_vec();
+        let pos = (view_y - top) as usize;
+        for _ in 0..n {
+            region.insert(pos, GridLine::new());
+        }
+        region.truncate(region_len);
+        for (j, line) in region.into_iter().enumerate() {
+            self.linedata[ti + j] = line;
+        }
+    }
+
+    /// DL: Delete *n* lines at view_y within scroll region [top, bottom].
+    pub fn delete_lines(&mut self, top: u32, bottom: u32, view_y: u32, n: u32) {
+        if n == 0 || view_y < top || view_y > bottom || top > bottom {
+            return;
+        }
+        let n = n.min(bottom - view_y + 1);
+        let ti = (self.hsize + top) as usize;
+        let bi = (self.hsize + bottom) as usize;
+        if bi >= self.linedata.len() {
+            return;
+        }
+        let region_len = (bottom - top + 1) as usize;
+        let mut region: Vec<GridLine> = self.linedata[ti..=bi].to_vec();
+        let pos = (view_y - top) as usize;
+        for _ in 0..n {
+            region.remove(pos);
+        }
+        while region.len() < region_len {
+            region.push(GridLine::new());
+        }
+        for (j, line) in region.into_iter().enumerate() {
+            self.linedata[ti + j] = line;
         }
     }
 
@@ -407,9 +530,8 @@ mod tests {
     #[test]
     fn test_scroll() {
         let mut g = Grid::new(80, 24);
-        g.flags |= 1;
         for _ in 0..10 {
-            g.scroll_history();
+            g.scroll_up();
         }
         assert_eq!(g.hsize, 10);
         assert!(g.linedata.len() >= 24);
@@ -418,8 +540,7 @@ mod tests {
     #[test]
     fn test_view_coords() {
         let mut g = Grid::new(80, 24);
-        g.flags |= 1;
-        g.scroll_history();
+        g.scroll_up();
         let cell = GridCell::default_cell();
         g.view_set_cell(0, 0, &cell);
         assert!(g.view_get_cell(0, 0).is_some());

@@ -234,7 +234,25 @@ mod tests {
 
     fn create_pair() -> (Peer, Peer) {
         let (a, b) = StdUnixStream::pair().unwrap();
+        // Non-blocking, mirroring real event-loop usage: large messages may
+        // overflow the kernel buffer and must be pumped.
+        a.set_nonblocking(true).unwrap();
+        b.set_nonblocking(true).unwrap();
         (Peer::new(UnixStream::from_std(a)), Peer::new(UnixStream::from_std(b)))
+    }
+
+    /// Pump data from `sender` to `receiver` until one full message arrives.
+    ///
+    /// With non-blocking sockets a large message may not fit in the kernel
+    /// buffer, so we alternate flushing the sender and draining the receiver
+    /// until the framed message is complete.
+    fn pump_message(sender: &mut Peer, receiver: &mut Peer) -> Message {
+        loop {
+            if let Some(msg) = receiver.recv().unwrap() {
+                return msg;
+            }
+            sender.flush().unwrap();
+        }
     }
 
     #[test]
@@ -288,16 +306,16 @@ mod tests {
     fn test_send_queue() {
         let (mut p1, mut p2) = create_pair();
 
-        // Use large messages to overflow the kernel buffer.
+        // A message large enough to overflow the kernel socket buffer, forcing
+        // the remainder into the send queue that the event loop must drain.
         let large = Message::IdentifyTerminfo(
-            (0..200).map(|i| (format!("cap{}", i), format!("val{}", i))).collect(),
+            (0..50_000).map(|i| (format!("cap{}", i), format!("val{}", i))).collect(),
         );
         p1.send(&large).unwrap();
 
-        // Flush and verify at least one message can be received.
-        p1.flush().unwrap();
+        let msg = pump_message(&mut p1, &mut p2);
+        assert!(matches!(msg, Message::IdentifyTerminfo(ref pairs) if pairs.len() == 50_000));
         assert!(!p1.has_pending_writes());
-        assert!(p2.recv().unwrap().is_some());
     }
 
     #[test]
@@ -308,9 +326,8 @@ mod tests {
             (0..1000).map(|i| (format!("cap{}", i), format!("val{}", i))).collect(),
         );
         p1.send(&large).unwrap();
-        p1.flush().unwrap();
 
-        let msg = p2.recv().unwrap().unwrap();
+        let msg = pump_message(&mut p1, &mut p2);
         match msg {
             Message::IdentifyTerminfo(pairs) => {
                 assert_eq!(pairs.len(), 1000);

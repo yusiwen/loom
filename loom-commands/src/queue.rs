@@ -130,7 +130,6 @@ mod tests {
     use crate::commands::all_commands;
     use crate::cmd::{CmdCtx, Registry};
     use std::collections::HashMap;
-    use loom_core::session::{Session, Window};
 
     #[test]
     fn test_basic_queue() {

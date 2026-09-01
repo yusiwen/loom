@@ -41,8 +41,7 @@ fn strip_ansi(s: &str) -> String {
 
 /// Render a window to an ANSI string.
 fn render_raw(window: &Window) -> String {
-    let mut buf = Vec::new();
-    redraw::redraw_window(window, &mut buf).unwrap();
+    let buf = redraw::render_to_buffer(window);
     String::from_utf8(buf).unwrap()
 }
 
@@ -69,7 +68,7 @@ fn put_char(window: &mut Window, x: u32, y: u32, ch: char, attr: u16) {
 /// Run a golden test. If GENERATE env var is set, (re)create the golden file.
 fn check_golden(name: &str, window: &Window) {
     let raw = render_raw(window);
-    let plain = strip_ansi(&raw);
+    let plain = render_plain(window);
     let golden_path = format!("tests/golden/{}.txt", name);
 
     if std::env::var("DEBUG_RAW").is_ok() {

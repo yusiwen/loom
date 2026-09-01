@@ -30,8 +30,7 @@ fn strip_ansi(s: &str) -> String {
 }
 
 fn render_plain(window: &Window) -> String {
-    let mut buf = Vec::new();
-    redraw::redraw_window(window, &mut buf).unwrap();
+    let buf = redraw::render_to_buffer(window);
     let ansi = String::from_utf8(buf).unwrap();
     strip_ansi(&ansi)
 }
@@ -53,7 +52,7 @@ fn put_str(window: &mut Window, x: u32, y: u32, s: &str, attr: u16) {
 
 fn check_scenario(name: &str, window: &Window) {
     let plain = render_plain(window);
-    let golden_path = format!("loom-server/tests/mock_golden/{}.txt", name);
+    let golden_path = format!("tests/mock_golden/{}.txt", name);
 
     if std::env::var("GENERATE").is_ok() {
         let mut f = fs::File::create(&golden_path).unwrap();

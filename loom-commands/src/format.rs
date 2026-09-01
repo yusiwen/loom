@@ -116,7 +116,7 @@ pub fn format_expand(template: &str, ctx: &FormatCtx) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use loom_core::session::{Session, Window, WindowPane};
+    use loom_core::session::{Session, Window};
 
     #[test]
     fn test_simple_var() {
@@ -126,7 +126,7 @@ mod tests {
 
     #[test]
     fn test_session_name() {
-        let mut session = Session::new(Some("test-session"), "/tmp");
+        let session = Session::new(Some("test-session"), "/tmp");
         let mut window = Window::new(80, 24);
         let pid = window.create_pane(80, 24);
         let pane = window.panes.get(&pid).unwrap();

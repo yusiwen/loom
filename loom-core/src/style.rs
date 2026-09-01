@@ -176,9 +176,9 @@ pub fn style_parse(s: &str) -> Style {
         if pos >= bytes.len() {
             break;
         }
-        let end = pos;
+        let mut end = pos;
         while end < bytes.len() && !delimiters.contains(&(bytes[end] as char)) {
-            let _ = end;
+            end += 1;
         }
         // parse kv pair
         let eq_pos = s[pos..].find('=');

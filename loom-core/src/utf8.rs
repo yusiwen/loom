@@ -24,15 +24,50 @@ impl Utf8Data {
         }
     }
 
-    pub fn space() -> Self {
+    /// Create a `Utf8Data` from a partially-received UTF-8 sequence.
+    /// Used when accumulating multi-byte sequences across read boundaries.
+    pub fn new_incomplete(data: &[u8], expected_bytes: u8) -> Self {
+        let mut buf = [0u8; UTF8_SIZE];
+        let n = data.len().min(UTF8_SIZE);
+        buf[..n].copy_from_slice(&data[..n]);
+        Self {
+            data: buf,
+            have: n as u8,
+            size: expected_bytes,
+            width: 0,
+        }
+    }
+
+    /// Determine the expected total byte length of a UTF-8 sequence
+    /// from its leading byte.
+    pub fn expected_size_from_leading(lead: u8) -> u8 {
+        if lead & 0x80 == 0 {
+            1
+        } else if lead & 0x20 == 0 {
+            2 // 110xxxxx
+        } else if lead & 0x10 == 0 {
+            3 // 1110xxxx
+        } else if lead & 0x08 == 0 {
+            4 // 11110xxx
+        } else {
+            1 // invalid; treat as single byte
+        }
+    }
+
+    /// True when a multi-byte UTF-8 sequence is in progress.
+    pub fn is_incomplete(&self) -> bool {
+        self.size > self.have
+    }
+
+    pub const fn space() -> Self {
         let mut data = [0u8; UTF8_SIZE];
         data[0] = b' ';
-        Self {
-            data,
-            have: 1,
-            size: 1,
-            width: 1,
-        }
+        Self { data, have: 1, size: 1, width: 1 }
+    }
+
+    /// Returns true if all expected bytes have been received.
+    pub fn is_complete(&self) -> bool {
+        self.have >= self.size
     }
 
     pub fn is_space(&self) -> bool {
@@ -86,14 +121,14 @@ pub fn utf8_open(data: u8) -> Utf8State {
 }
 
 pub fn utf8_append(data: &mut Utf8Data, ch: u8) -> Utf8State {
-    if data.size as usize >= UTF8_SIZE {
+    if data.have as usize >= UTF8_SIZE {
         return Utf8State::Error;
     }
-    data.data[data.size as usize] = ch;
-    data.size += 1;
+    data.data[data.have as usize] = ch;
     data.have += 1;
 
-    if data.size >= 4 {
+    // Complete once we've collected all bytes expected for this sequence.
+    if data.have == data.size {
         let len = data.size as usize;
         return match core::str::from_utf8(&data.data[..len]) {
             Ok(s) => {

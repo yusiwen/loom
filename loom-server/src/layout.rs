@@ -1,4 +1,4 @@
-use loom_core::session::{LayoutCell, LayoutCellIdx, LayoutType, PaneId, Window};
+use loom_core::session::{LayoutCell, LayoutCellIdx, LayoutType, PaneId, Window, WINDOW_ZOOMED};
 
 /// Split a pane horizontally (left/right) or vertically (top/bottom).
 pub fn layout_split_pane(
@@ -197,5 +197,135 @@ pub fn fix_layout_panes(window: &mut Window) {
                 pane.screen.resize(cell.sx, cell.sy);
             }
         }
+    }
+}
+
+/// Resize a window to a new size, redistributing space across the layout tree.
+/// (P0-10) The layout cells are recomputed from the root and panes follow.
+pub fn layout_resize(window: &mut Window, sx: u32, sy: u32) {
+    window.sx = sx;
+    window.sy = sy;
+
+    let root = match window.layout_root {
+        Some(r) => r,
+        None => {
+            // No layout tree: put every pane at full size (shouldn't normally happen).
+            for pane in window.panes.values_mut() {
+                pane.sx = sx;
+                pane.sy = sy;
+                pane.xoff = 0;
+                pane.yoff = 0;
+                pane.screen.resize(sx, sy);
+            }
+            return;
+        }
+    };
+
+    resize_cell(window, root, 0, 0, sx, sy);
+    fix_layout_panes(window);
+}
+
+/// Toggle zoom for `pane_id` (tmux `resize-pane -Z`): when zoomed the active
+/// pane cell covers the whole window; its previous geometry is saved in the
+/// cell's `saved_*` fields and restored on unzoom.
+pub fn layout_zoom(window: &mut Window, pane_id: PaneId) -> bool {
+    if window.panes.len() < 2 {
+        return false;
+    }
+    let cell_idx = match window.panes.get(&pane_id).and_then(|p| p.layout_cell) {
+        Some(i) => i,
+        None => return false,
+    };
+    {
+        let cell = &mut window.cells[cell_idx];
+        if window.flags & WINDOW_ZOOMED != 0 {
+            // Unzoom: restore the saved geometry.
+            cell.sx = cell.saved_sx.max(1);
+            cell.sy = cell.saved_sy.max(1);
+            cell.xoff = cell.saved_xoff;
+            cell.yoff = cell.saved_yoff;
+            window.flags &= !WINDOW_ZOOMED;
+        } else {
+            // Zoom: save the current geometry and expand to the full window.
+            cell.saved_sx = cell.sx;
+            cell.saved_sy = cell.sy;
+            cell.saved_xoff = cell.xoff;
+            cell.saved_yoff = cell.yoff;
+            cell.sx = window.sx;
+            cell.sy = window.sy;
+            cell.xoff = 0;
+            cell.yoff = 0;
+            window.flags |= WINDOW_ZOOMED;
+        }
+    }
+    fix_layout_panes(window);
+    true
+}
+
+/// Recursively assign (x, y, w, h) to a cell and distribute space to its children.
+fn resize_cell(window: &mut Window, idx: usize, x: i32, y: i32, w: u32, h: u32) {
+    let (cell_type, children) = {
+        let cell = &window.cells[idx];
+        (cell.cell_type, cell.children.clone())
+    };
+
+    // Set this cell's position and size.
+    {
+        let cell = &mut window.cells[idx];
+        cell.xoff = x;
+        cell.yoff = y;
+        cell.sx = w;
+        cell.sy = h;
+    }
+
+    // Leaf: nothing to distribute.
+    if cell_type == LayoutType::WindowPane || children.is_empty() {
+        return;
+    }
+
+    match cell_type {
+        LayoutType::LeftRight => {
+            let total_w: u32 = children
+                .iter()
+                .filter(|&&ci| ci < window.cells.len())
+                .map(|&ci| window.cells[ci].sx)
+                .sum();
+            let n = children.len().max(1) as u32;
+            let mut cx = x;
+            for &ci in &children {
+                if ci >= window.cells.len() {
+                    continue;
+                }
+                let cw = if total_w > 0 {
+                    w.saturating_mul(window.cells[ci].sx).saturating_div(total_w)
+                } else {
+                    w / n
+                };
+                resize_cell(window, ci, cx, y, cw, h);
+                cx += cw as i32;
+            }
+        }
+        LayoutType::TopBottom => {
+            let total_h: u32 = children
+                .iter()
+                .filter(|&&ci| ci < window.cells.len())
+                .map(|&ci| window.cells[ci].sy)
+                .sum();
+            let n = children.len().max(1) as u32;
+            let mut cy = y;
+            for &ci in &children {
+                if ci >= window.cells.len() {
+                    continue;
+                }
+                let ch = if total_h > 0 {
+                    h.saturating_mul(window.cells[ci].sy).saturating_div(total_h)
+                } else {
+                    h / n
+                };
+                resize_cell(window, ci, x, cy, w, ch);
+                cy += ch as i32;
+            }
+        }
+        _ => {}
     }
 }

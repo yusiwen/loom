@@ -284,7 +284,7 @@ impl Cmd for SendKeys {
                 for key in &args.positional {
                     match key.as_str() {
                         "Enter" => { screen.cx = 0; screen.cy += 1;
-                            if screen.cy >= screen.size_y() { screen.cy = screen.size_y() - 1; screen.grid.scroll_history(); } }
+                            if screen.cy >= screen.size_y() { screen.cy = screen.size_y() - 1; screen.grid.scroll_up(); } }
                         "Space" => { let gc = loom_core::grid_cell::GridCell { data: loom_core::utf8::Utf8Data::new(' '), ..Default::default() };
                             screen.grid.view_set_cell(screen.cx, screen.cy, &gc); screen.cx += 1; }
                         "Backspace" | "BS" => { if screen.cx > 0 { screen.cx -= 1; } }
@@ -296,7 +296,7 @@ impl Cmd for SendKeys {
                             let gc = loom_core::grid_cell::GridCell { data: loom_core::utf8::Utf8Data::new(ch), ..Default::default() };
                             screen.grid.view_set_cell(screen.cx, screen.cy, &gc); screen.cx += 1;
                             if screen.cx >= screen.size_x() { screen.cx = 0; screen.cy += 1;
-                                if screen.cy >= screen.size_y() { screen.cy = screen.size_y() - 1; screen.grid.scroll_history(); } }
+                                if screen.cy >= screen.size_y() { screen.cy = screen.size_y() - 1; screen.grid.scroll_up(); } }
                         }}
                     }
                 }
