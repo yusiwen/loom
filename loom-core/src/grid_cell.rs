@@ -327,6 +327,45 @@ impl Grid {
         }
     }
 
+    /// Number of cells written on absolute line `line` (0 when unknown).
+    pub fn cellused(&self, line: u32) -> u32 {
+        self.get_line(line).map(|l| l.cellused).unwrap_or(0)
+    }
+
+    /// Extract the text between two absolute (line, column) endpoints.
+    /// Lines are joined with newlines; trailing spaces are trimmed.
+    /// If the selection ends at column 0 of a line, that line contributes
+    /// nothing (matching how a cursor at line start selects nothing of it).
+    pub fn extract_selection(&self, a: (u32, u32), b: (u32, u32)) -> String {
+        let (l1, c1) = if a <= b { a } else { b };
+        let (l2, c2) = if a <= b { b } else { a };
+        let total = self.total_lines();
+        if l2 >= total {
+            return String::new();
+        }
+        let mut lines: Vec<String> = Vec::new();
+        for line in l1..=l2 {
+            let end = if line == l2 { c2 } else { self.cellused(line).min(self.sx) };
+            let start = if line == l1 { c1.min(end) } else { 0 };
+            let mut text = String::new();
+            for x in start..end {
+                if let Some(cell) = self.get_cell(x, line) {
+                    if cell.is_visible() {
+                        text.push(cell.data.to_char());
+                    }
+                }
+            }
+            text = text.trim_end().to_string();
+            lines.push(text);
+        }
+        // A selection ending at the start of a line leaves a trailing empty
+        // line; drop it so `copy-paste` doesn't append a blank line.
+        if lines.last() == Some(&String::new()) && lines.len() > 1 {
+            lines.pop();
+        }
+        lines.join("\n")
+    }
+
     /// Set or clear the WRAPPED flag on a visible line.
     pub fn set_line_wrapped(&mut self, view_y: u32, wrapped: bool) {
         if let Some(line) = self.get_line_mut(self.view_line(view_y)) {
@@ -544,5 +583,51 @@ mod tests {
         let cell = GridCell::default_cell();
         g.view_set_cell(0, 0, &cell);
         assert!(g.view_get_cell(0, 0).is_some());
+    }
+
+    /// Fill absolute line `line` (0..cellused on the visible row when
+    /// scrolling) with a repeated char for selection tests.
+    fn fill_line(g: &mut Grid, line: u32, s: &str) {
+        for (i, ch) in s.chars().enumerate() {
+            g.set_cell(i as u32, line, &GridCell {
+                data: Utf8Data::new(ch),
+                ..GridCell::default_cell()
+            });
+        }
+    }
+
+    #[test]
+    fn test_extract_selection_same_line() {
+        let mut g = Grid::new(80, 24);
+        // Line 23 is the last visible row.
+        fill_line(&mut g, 23, "hello world");
+        let text = g.extract_selection((23, 0), (23, 5));
+        assert_eq!(text, "hello");
+        // Reversed endpoints give the same result.
+        assert_eq!(g.extract_selection((23, 5), (23, 0)), "hello");
+    }
+
+    #[test]
+    fn test_extract_selection_multi_line() {
+        let mut g = Grid::new(80, 24);
+        // Push three lines into history via scroll_up.
+        for _ in 0..3 {
+            g.scroll_up();
+        }
+        // hsize == 3 now; live rows are 3..27.
+        fill_line(&mut g, 25, "foo bar");
+        fill_line(&mut g, 26, "baz qux");
+        // Select from "o bar" on line 25 to "ba" on line 26.
+        let text = g.extract_selection((25, 1), (26, 2));
+        assert_eq!(text, "oo bar\nba");
+    }
+
+    #[test]
+    fn test_extract_selection_trailing_blank_dropped() {
+        let mut g = Grid::new(80, 24);
+        fill_line(&mut g, 22, "abc");
+        // Ending at column 0 of the next line must not append a blank line.
+        let text = g.extract_selection((22, 0), (23, 0));
+        assert_eq!(text, "abc");
     }
 }

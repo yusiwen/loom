@@ -127,6 +127,73 @@ impl LayoutCell {
     }
 }
 
+/// ── Copy mode (tmux `copy-mode`) ─────────────────────────────────────
+/// Per-pane state for the visual copy/scrollback mode. The view is a window
+/// of `sy` rows over the pane's grid (history + live screen); `scroll` lines
+/// are pulled up from the bottom. Selection endpoints are stored in *absolute*
+/// line/column coordinates (line 0 = oldest history line) so they stay valid
+/// while scrolling.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CopyMode {
+    /// Copy mode is active in this pane.
+    pub active: bool,
+    /// Lines scrolled up from the bottom of the live screen (0..=hsize).
+    pub scroll: u32,
+    /// Cursor column within the view (0..sx-1).
+    pub cx: u32,
+    /// Cursor row within the view (0..sy-1).
+    pub cy: u32,
+    /// Visual selection is in progress.
+    pub visual: bool,
+    /// Selection anchor: (absolute line, column).
+    pub sel_anchor: Option<(u32, u32)>,
+    /// Previous key was `g` (for the `gg` top jump).
+    pub last_g: bool,
+}
+
+impl CopyMode {
+    /// Absolute grid line of view row `r` at the current scroll offset.
+    pub fn abs_line(&self, r: u32, hsize: u32) -> u32 {
+        hsize.saturating_sub(self.scroll) + r
+    }
+
+    /// Absolute (line, column) of the cursor.
+    pub fn cursor_abs(&self, hsize: u32) -> (u32, u32) {
+        (self.abs_line(self.cy, hsize), self.cx)
+    }
+
+    /// Enter copy mode with the cursor on the bottom-right live cell.
+    pub fn enter(&mut self, sx: u32, sy: u32) {
+        self.active = true;
+        self.scroll = 0;
+        self.cx = sx.saturating_sub(1);
+        self.cy = sy.saturating_sub(1);
+        self.visual = false;
+        self.sel_anchor = None;
+        self.last_g = false;
+    }
+
+    /// Leave copy mode, dropping any in-progress selection.
+    pub fn exit(&mut self) {
+        self.active = false;
+        self.visual = false;
+        self.sel_anchor = None;
+        self.last_g = false;
+    }
+
+    /// Normalized selection endpoints (lo, hi) in absolute coordinates, or
+    /// `None` when no selection is in progress.
+    pub fn selection_range(&self, hsize: u32) -> Option<((u32, u32), (u32, u32))> {
+        let a = self.sel_anchor?;
+        let b = self.cursor_abs(hsize);
+        if a <= b {
+            Some((a, b))
+        } else {
+            Some((b, a))
+        }
+    }
+}
+
 /// ── Window Pane ──
 #[derive(Debug)]
 pub struct WindowPane {
@@ -147,6 +214,8 @@ pub struct WindowPane {
     pub options: Options,
     pub layout_cell: Option<usize>, // index into window's layout
     pub last_activity: u64,
+    /// Copy-mode (tmux `copy-mode`) state for this pane.
+    pub copy: CopyMode,
 }
 
 impl WindowPane {
@@ -169,6 +238,7 @@ impl WindowPane {
             options: Options::new(),
             layout_cell: None,
             last_activity: 0,
+            copy: CopyMode::default(),
         }
     }
 
@@ -403,6 +473,34 @@ mod tests {
         let wid = s.detach_window(0);
         assert_eq!(wid, Some(w.id));
         assert!(s.curw_idx.is_none());
+    }
+
+    #[test]
+    fn test_copy_mode_state() {
+        use crate::session::CopyMode;
+        let mut cm = CopyMode::default();
+        assert!(!cm.active);
+
+        cm.enter(80, 24);
+        assert!(cm.active);
+        assert_eq!(cm.cx, 79);
+        assert_eq!(cm.cy, 23);
+        assert_eq!(cm.scroll, 0);
+
+        // With hsize=5 and scroll=2, view row 0 is absolute line 3.
+        cm.scroll = 2;
+        assert_eq!(cm.abs_line(0, 5), 3);
+        assert_eq!(cm.cursor_abs(5), (3 + 23, 79));
+
+        // Selection range is normalized.
+        cm.cx = 4;
+        cm.cy = 0;
+        cm.sel_anchor = Some((5, 10));
+        assert_eq!(cm.selection_range(5), Some(((3, 4), (5, 10))));
+
+        cm.exit();
+        assert!(!cm.active);
+        assert!(cm.sel_anchor.is_none());
     }
 
     #[test]

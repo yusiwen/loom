@@ -1,5 +1,5 @@
 use loom_core::grid_cell::GridCell;
-use loom_core::session::{Window, WINDOW_ZOOMED};
+use loom_core::session::{Window, WindowPane, WINDOW_ZOOMED};
 use loom_core::utf8::Utf8Data;
 use loom_tty::tty::Tty;
 use loom_tty::tty_draw;
@@ -33,19 +33,46 @@ fn draw_all_panes(tty: &mut Tty, window: &Window) {
                 continue;
             }
             let pane_y = pane_y as u32;
-            let screen = &pane.screen;
+            if pane.copy.active {
+                // B4: copy-mode view — history/live rows at the pane's scroll
+                // offset, with the active selection in reverse video.
+                draw_copy_line(tty, pane, pane_y, y);
+            } else {
+                let screen = &pane.screen;
 
-            // Draw the pane line
-            tty_draw::tty_draw_line(
-                tty,
-                screen,
-                0,           // source x
-                pane_y,      // source y
-                pane.sx,     // width
-                pane.xoff as u32, // target x
-                y,           // target y
-            );
+                // Draw the pane line
+                tty_draw::tty_draw_line(
+                    tty,
+                    screen,
+                    0,           // source x
+                    pane_y,      // source y
+                    pane.sx,     // width
+                    pane.xoff as u32, // target x
+                    y,           // target y
+                );
+            }
         }
+    }
+}
+
+/// Draw one row of a pane's copy-mode view: the grid row at the pane's
+/// scroll offset, with cells in the active selection rendered in reverse
+/// video.
+fn draw_copy_line(tty: &mut Tty, pane: &WindowPane, view_y: u32, target_y: u32) {
+    use loom_core::grid_cell::GRID_ATTR_REVERSE;
+
+    let grid = &pane.screen.grid;
+    let hsize = grid.hsize;
+    let abs = pane.copy.abs_line(view_y, hsize);
+    let sel = pane.copy.selection_range(hsize);
+    for x in 0..pane.sx {
+        let mut cell = grid.get_cell(x, abs).copied().unwrap_or_default();
+        if let Some((lo, hi)) = sel {
+            if (abs, x) >= lo && (abs, x) <= hi {
+                cell.attr |= GRID_ATTR_REVERSE;
+            }
+        }
+        tty.tty_cell(pane.xoff as u32 + x, target_y, &cell);
     }
 }
 
@@ -119,10 +146,15 @@ fn status_cell(style: StatusStyle) -> GridCell {
 pub fn position_cursor(tty: &mut Tty, window: &Window) {
     if let Some(pid) = window.active_pane_id {
         if let Some(pane) = window.panes.get(&pid) {
-            let cx = (pane.xoff as u32).saturating_add(pane.screen.cx)
-                .min(window.sx.saturating_sub(1));
-            let cy = (pane.yoff as u32).saturating_add(pane.screen.cy)
-                .min(window.sy.saturating_sub(1));
+            // B4: while the active pane is in copy-mode, the visible cursor
+            // is the copy-mode cursor, not the live screen's.
+            let (cx, cy) = if pane.copy.active {
+                (pane.copy.cx, pane.copy.cy)
+            } else {
+                (pane.screen.cx, pane.screen.cy)
+            };
+            let cx = (pane.xoff as u32).saturating_add(cx).min(window.sx.saturating_sub(1));
+            let cy = (pane.yoff as u32).saturating_add(cy).min(window.sy.saturating_sub(1));
             tty.tty_cursor(cx, cy);
         }
     }
@@ -210,5 +242,53 @@ mod tests {
             cup_count
         );
         assert!(second.len() < first.len() + 16);
+    }
+
+    /// B4: a pane in copy-mode renders its selection in reverse video and
+    /// places the cursor at the copy-mode position, not the live screen's.
+    #[test]
+    fn test_copy_mode_renders_selection_and_cursor() {
+        use loom_core::grid_cell::GridCell;
+        use loom_core::session::WindowPane;
+        use loom_core::utf8::Utf8Data;
+
+        let mut window = Window::new(20, 5);
+        let wid = window.id;
+        let mut pane = WindowPane::new(wid, 20, 5);
+        let pid = pane.id;
+        // "hello world" on the top live row.
+        for (i, ch) in "hello world".chars().enumerate() {
+            pane.screen.grid.set_cell(i as u32, 0, &GridCell {
+                data: Utf8Data::new(ch),
+                ..GridCell::default_cell()
+            });
+        }
+        // Enter copy mode: cursor at col 4, row 0; visual selection from
+        // (line 0, col 0) to the cursor (line 0, col 4) => "hell".
+        pane.copy.active = true;
+        pane.copy.scroll = 0;
+        pane.copy.cx = 4;
+        pane.copy.cy = 0;
+        pane.copy.visual = true;
+        pane.copy.sel_anchor = Some((0, 0));
+        window.panes.insert(pid, pane);
+        window.active_pane_id = Some(pid);
+
+        let mut tty = Tty::new(20, 5);
+        redraw_window(&mut tty, &window);
+        position_cursor(&mut tty, &window);
+        let s = String::from_utf8_lossy(&tty.take_output()).into_owned();
+
+        // The selection must be rendered with the reverse attribute (SGR 7).
+        assert!(
+            s.contains(";7m"),
+            "expected reverse-video SGR in copy-mode output, got: {s}"
+        );
+        // The copy-mode cursor (row 0 -> screen row 1, col 4 -> screen col 5)
+        // must be positioned, not the live screen cursor.
+        assert!(
+            s.contains("\x1b[1;5H"),
+            "expected CUP to copy-mode cursor position, got: {s}"
+        );
     }
 }

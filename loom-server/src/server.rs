@@ -8,9 +8,10 @@ use mio::{event::Event, Events, Interest, Poll, Registry, Token, Waker};
 use mio::unix::SourceFd;
 
 use loom_core::log::Logger;
+use loom_core::grid_cell::Grid;
 use loom_core::session::{
-    PaneId, Session, SessionId, Window, WindowId, WINLINK_ALERTFLAGS, WINLINK_BELL,
-    WINDOW_ACTIVITY, WINDOW_BELL,
+    CopyMode, PaneId, Session, SessionId, Window, WindowId, WindowPane, WINLINK_ALERTFLAGS,
+    WINLINK_BELL, WINDOW_ACTIVITY, WINDOW_BELL,
 };
 use loom_ipc::message::Message;
 use loom_ipc::peer::Peer;
@@ -104,6 +105,8 @@ pub struct Server {
     next_pty_token: usize,
     /// Persistent per-pane input parsers (state survives across reads).
     parsers: HashMap<PaneId, Parser>,
+    /// Global paste buffer (last yank from copy-mode).
+    paste_buffer: String,
     pub exit: bool,
 }
 
@@ -127,6 +130,7 @@ impl Server {
             pty_fds: HashMap::new(),
             next_pty_token: 0,
             parsers: HashMap::new(),
+            paste_buffer: String::new(),
             exit: false,
         })
     }
@@ -822,20 +826,42 @@ impl Server {
                 loom_core::log_debug!(self.log, "dispatch", "KeyPress ({} bytes)", key.len());
                 if let Some(client) = self.clients.get(&token) {
                     if let Some(sid) = client.session_id {
-                        if let Some(session) = self.sessions.get(&sid) {
-                            if let Some(wl) = session.current_winlink() {
-                                if let Some(window) = self.windows.get(&wl.window_id) {
-                                    if let Some(active_pane_id) = window.active_pane_id {
-                                        if let Some(pane) = window.panes.get(&active_pane_id) {
-                                            if let Some(pfd) = pane.fd {
-                                                let bfd =
-                                                    unsafe { BorrowedFd::borrow_raw(pfd) };
-                                                let _ = nix::unistd::write(&bfd, &key);
-                                            }
-                                        }
+                        // Resolve target pane ids before taking a mutable
+                        // borrow; copy-mode routing decides whether the key
+                        // reaches the PTY at all.
+                        let target: Option<(WindowId, PaneId, bool)> =
+                            self.sessions.get(&sid).and_then(|session| {
+                                session
+                                    .current_winlink()
+                                    .and_then(|wl| {
+                                        let wid = wl.window_id;
+                                        self.windows.get(&wid).and_then(|window| {
+                                            window
+                                                .active_pane_id
+                                                .and_then(|pid| {
+                                                    window
+                                                        .panes
+                                                        .get(&pid)
+                                                        .map(|p| (wid, pid, p.copy.active))
+                                                })
+                                        })
+                                    })
+                            });
+                        match target {
+                            Some((wid, pid, in_copy_mode)) => {
+                                if in_copy_mode {
+                                    self.copy_mode_key(sid, wid, pid, &key);
+                                } else if let Some(pane) =
+                                    self.windows.get_mut(&wid).and_then(|w| w.panes.get_mut(&pid))
+                                {
+                                    if let Some(pfd) = pane.fd {
+                                        let bfd =
+                                            unsafe { BorrowedFd::borrow_raw(pfd) };
+                                        let _ = nix::unistd::write(&bfd, &key);
                                     }
                                 }
                             }
+                            None => {}
                         }
                     }
                 }
@@ -910,6 +936,8 @@ impl Server {
             m.insert("list-clients", Self::cmd_list_clients);
             m.insert("show-options", Self::cmd_show_options);
             m.insert("run-shell", Self::cmd_run_shell);
+            m.insert("copy-mode", Self::cmd_copy_mode);
+            m.insert("paste-buffer", Self::cmd_paste_buffer);
             m
         })
     }
@@ -1424,6 +1452,87 @@ impl Server {
         Ok(())
     }
 
+    /// B4: enter copy-mode on the active pane.
+    fn cmd_copy_mode(&mut self, token: Token, _args: &[String]) -> io::Result<()> {
+        let token = match self.clients.get(&token) {
+            Some(c) if c.session_id.is_some() => token,
+            _ => return Ok(()),
+        };
+        let sid = self.clients.get(&token).unwrap().session_id.unwrap();
+        let wid = match self.sessions.get(&sid).and_then(|s| s.current_winlink()) {
+            Some(wl) => wl.window_id,
+            None => return Ok(()),
+        };
+        if let Some(window) = self.windows.get_mut(&wid) {
+            if let Some(pid) = window.active_pane_id {
+                if let Some(pane) = window.panes.get_mut(&pid) {
+                    pane.copy.enter(pane.sx, pane.sy);
+                }
+            }
+        }
+        self.broadcast_redraw(sid, wid, false);
+        Ok(())
+    }
+
+    /// B4: paste the global paste buffer into the active pane's PTY.
+    fn cmd_paste_buffer(&mut self, token: Token, _args: &[String]) -> io::Result<()> {
+        let token = match self.clients.get(&token) {
+            Some(c) if c.session_id.is_some() => token,
+            _ => return Ok(()),
+        };
+        let sid = self.clients.get(&token).unwrap().session_id.unwrap();
+        let buf = self.paste_buffer.clone();
+        if buf.is_empty() {
+            return Ok(());
+        }
+        let wid = match self.sessions.get(&sid).and_then(|s| s.current_winlink()) {
+            Some(wl) => wl.window_id,
+            None => return Ok(()),
+        };
+        if let Some(window) = self.windows.get(&wid) {
+            if let Some(pid) = window.active_pane_id {
+                if let Some(pane) = window.panes.get(&pid) {
+                    if let Some(pfd) = pane.fd {
+                        let bfd = unsafe { BorrowedFd::borrow_raw(pfd) };
+                        let _ = nix::unistd::write(&bfd, buf.as_bytes());
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// B4: process one keypress for a pane in copy-mode. The key never
+    /// reaches the PTY; the view/selection updates instead.
+    fn copy_mode_key(&mut self, sid: SessionId, wid: WindowId, pid: PaneId, key: &[u8]) {
+        if self.copy_mode_step(wid, pid, key) {
+            self.broadcast_redraw(sid, wid, false);
+        }
+    }
+
+    /// Advance the copy-mode state machine for one key. Returns true when
+    /// the view or selection changed (a redraw is needed).
+    fn copy_mode_step(&mut self, wid: WindowId, pid: PaneId, key: &[u8]) -> bool {
+        let (redraw, yank): (bool, Option<String>) = {
+            let window = match self.windows.get_mut(&wid) {
+                Some(w) => w,
+                None => return false,
+            };
+            let pane = match window.panes.get_mut(&pid) {
+                Some(p) => p,
+                None => return false,
+            };
+            if !pane.copy.active {
+                return false;
+            }
+            step_copy_mode(pane, key)
+        };
+        if let Some(text) = yank {
+            self.paste_buffer = text;
+        }
+        redraw
+    }
+
     fn do_split_window(&mut self, token: Token, vertical: bool) -> io::Result<()> {
         if let Some(client) = self.clients.get(&token) {
             if let Some(sid) = client.session_id {
@@ -1636,6 +1745,196 @@ fn window_display_name(windows: &HashMap<WindowId, Window>, wid: WindowId) -> St
     "shell".into()
 }
 
+/// B4: advance the copy-mode state machine for one keypress.
+///
+/// Returns `(redraw_needed, yank_text)`. `yank_text` is `Some` when the key
+/// is `y` and a selection existed: the text is the yanked selection, and
+/// copy mode is exited. Every key is consumed while copy mode is active, so
+/// nothing reaches the PTY.
+fn step_copy_mode(pane: &mut WindowPane, key: &[u8]) -> (bool, Option<String>) {
+    let sx = pane.sx.max(1);
+    let sy = pane.sy.max(1);
+    let hsize = pane.screen.grid.hsize;
+    let c = &mut pane.copy;
+    let mut redraw = false;
+    let mut yank: Option<String> = None;
+
+    match key {
+        b"q" | b"\x1b" => {
+            c.exit();
+            redraw = true;
+        }
+        b"h" | b"\x1b[D" => {
+            if c.cx > 0 {
+                c.cx -= 1;
+                redraw = true;
+            }
+        }
+        b"l" | b"\x1b[C" => {
+            if c.cx + 1 < sx {
+                c.cx += 1;
+                redraw = true;
+            }
+        }
+        b"k" | b"\x1b[A" => {
+            if c.cy > 0 {
+                c.cy -= 1;
+                redraw = true;
+            } else if c.scroll < hsize {
+                c.scroll += 1;
+                redraw = true;
+            }
+        }
+        b"j" | b"\x1b[B" => {
+            if c.cy + 1 < sy {
+                c.cy += 1;
+                redraw = true;
+            } else if c.scroll > 0 {
+                c.scroll -= 1;
+                redraw = true;
+            }
+        }
+        b" " => {
+            // Page down.
+            let before = c.scroll;
+            c.scroll = c.scroll.saturating_sub(sy);
+            if c.scroll != before {
+                redraw = true;
+            }
+        }
+        b"?" => {
+            // Page up.
+            let before = c.scroll;
+            c.scroll = (c.scroll + sy).min(hsize);
+            if c.scroll != before {
+                redraw = true;
+            }
+        }
+        b"0" => {
+            if c.cx != 0 {
+                c.cx = 0;
+                redraw = true;
+            }
+        }
+        b"$" => {
+            if c.cx != sx - 1 {
+                c.cx = sx - 1;
+                redraw = true;
+            }
+        }
+        b"G" => {
+            if c.scroll != 0 || c.cy != sy - 1 {
+                c.scroll = 0;
+                c.cy = sy - 1;
+                redraw = true;
+            }
+        }
+        b"g" => {
+            if c.last_g {
+                c.last_g = false;
+                if c.scroll != hsize || c.cy != 0 {
+                    c.scroll = hsize;
+                    c.cy = 0;
+                    redraw = true;
+                }
+            } else {
+                c.last_g = true;
+            }
+        }
+        b"v" => {
+            if c.visual {
+                c.visual = false;
+                c.sel_anchor = None;
+            } else {
+                c.visual = true;
+                c.sel_anchor = Some(c.cursor_abs(hsize));
+            }
+            redraw = true;
+        }
+        b"y" => {
+            // Yank the current selection into the paste buffer, then exit.
+            if let Some((lo, hi)) = c.selection_range(hsize) {
+                yank = Some(pane.screen.grid.extract_selection(lo, hi));
+            }
+            c.exit();
+            redraw = true;
+        }
+        b"w" => {
+            let abs = c.abs_line(c.cy, hsize);
+            let (la, lc) = word_forward(&pane.screen.grid, abs, c.cx, sx);
+            let (old_cy, old_cx) = (c.cy, c.cx);
+            apply_word_jump(c, hsize, sy, la, lc);
+            if (c.cy, c.cx) != (old_cy, old_cx) {
+                redraw = true;
+            }
+        }
+        b"b" => {
+            let abs = c.abs_line(c.cy, hsize);
+            let (la, lc) = word_backward(&pane.screen.grid, abs, c.cx, sx);
+            let (old_cy, old_cx) = (c.cy, c.cx);
+            apply_word_jump(c, hsize, sy, la, lc);
+            if (c.cy, c.cx) != (old_cy, old_cx) {
+                redraw = true;
+            }
+        }
+        _ => {}
+    }
+    (redraw, yank)
+}
+
+/// Convert an absolute (line, col) target back to view coordinates, clamped
+/// to the visible view window.
+fn apply_word_jump(c: &mut CopyMode, hsize: u32, sy: u32, abs_line: u32, col: u32) {
+    let view_row = abs_line.saturating_sub(hsize.saturating_sub(c.scroll));
+    c.cy = view_row.min(sy.saturating_sub(1));
+    c.cx = col;
+}
+
+/// Target for vi `w`: the first non-space at or after (line, x+1); when the
+/// rest of the line is blank, the first column of the next line.
+fn word_forward(grid: &Grid, line: u32, x: u32, sx: u32) -> (u32, u32) {
+    let total = grid.total_lines();
+    let mut l = line;
+    let mut x = x + 1;
+    let ch = |l: u32, x: u32| grid.get_cell(x, l).map(|c| c.data.to_char()).unwrap_or(' ');
+    while l < total {
+        while x < sx && ch(l, x) == ' ' {
+            x += 1;
+        }
+        if x < sx {
+            return (l, x);
+        }
+        l += 1;
+        x = 0;
+    }
+    (line, sx.saturating_sub(1))
+}
+
+/// Target for vi `b`: the start of the word containing (line, x), or the
+/// start of the previous word when (line, x) is a space.
+fn word_backward(grid: &Grid, line: u32, x: u32, sx: u32) -> (u32, u32) {
+    let ch = |l: u32, x: u32| grid.get_cell(x, l).map(|c| c.data.to_char()).unwrap_or(' ');
+    let mut l = line;
+    let mut x = x;
+    loop {
+        if x == 0 {
+            if l == 0 {
+                return (0, 0);
+            }
+            l -= 1;
+            x = sx.saturating_sub(1);
+            continue;
+        }
+        x -= 1;
+        if ch(l, x) != ' ' {
+            while x > 0 && ch(l, x - 1) != ' ' {
+                x -= 1;
+            }
+            return (l, x);
+        }
+    }
+}
+
 /// Find the pane to select when moving in direction `dir` from the active
 /// pane: the nearest pane strictly in that direction.
 fn pane_in_direction(window: &Window, dir: &str) -> Option<PaneId> {
@@ -1705,5 +2004,82 @@ mod tests {
         };
         let server = Server::new(config).unwrap();
         assert_eq!(server.clients.len(), 0);
+    }
+
+    /// Build a server with one 80x24 window/pane, filled with two text
+    /// lines, and enter copy mode on the pane.
+    fn server_with_copy_pane() -> (Server, WindowId, PaneId) {
+        use loom_core::grid_cell::GridCell;
+        use loom_core::utf8::Utf8Data;
+
+        let config = ServerConfig {
+            socket_path: format!("/tmp/loom-copy-{}.sock", std::process::id()),
+            socket_mode: 0o600,
+        };
+        let mut server = Server::new(config).unwrap();
+        let mut window = Window::new(80, 24);
+        let wid = window.id;
+        let mut pane = WindowPane::new(wid, 80, 24);
+        let pid = pane.id;
+        for (i, ch) in "hello world".chars().enumerate() {
+            pane.screen.grid.set_cell(i as u32, 0, &GridCell {
+                data: Utf8Data::new(ch),
+                ..GridCell::default_cell()
+            });
+        }
+        for (i, ch) in "foo bar".chars().enumerate() {
+            pane.screen.grid.set_cell(i as u32, 1, &GridCell {
+                data: Utf8Data::new(ch),
+                ..GridCell::default_cell()
+            });
+        }
+        window.panes.insert(pid, pane);
+        window.active_pane_id = Some(pid);
+        window.pane_order.push_back(pid);
+        server.windows.insert(wid, window);
+
+        server
+            .windows
+            .get_mut(&wid)
+            .unwrap()
+            .panes
+            .get_mut(&pid)
+            .unwrap()
+            .copy
+            .enter(80, 24);
+        (server, wid, pid)
+    }
+
+    #[test]
+    fn test_copy_mode_move_and_yank() {
+        let (mut server, wid, pid) = server_with_copy_pane();
+        // From bottom-right, jump to top-left (gg + 0), select visually,
+        // extend right 4 cells and yank: "hell".
+        let _ = server.copy_mode_step(wid, pid, b"g");
+        let _ = server.copy_mode_step(wid, pid, b"g");
+        let _ = server.copy_mode_step(wid, pid, b"0");
+        let _ = server.copy_mode_step(wid, pid, b"v");
+        for _ in 0..4 {
+            let _ = server.copy_mode_step(wid, pid, b"l");
+        }
+        let _ = server.copy_mode_step(wid, pid, b"y");
+        assert_eq!(server.paste_buffer, "hell");
+        // Yank exits copy mode.
+        assert!(!server.windows.get(&wid).unwrap().panes.get(&pid).unwrap().copy.active);
+    }
+
+    #[test]
+    fn test_copy_mode_scroll_and_quit() {
+        let (mut server, wid, pid) = server_with_copy_pane();
+
+        // Move to the top (gg). With no history, scrolling up further is a
+        // no-op and must not request a redraw.
+        let _ = server.copy_mode_step(wid, pid, b"g");
+        let _ = server.copy_mode_step(wid, pid, b"g");
+        assert!(!server.copy_mode_step(wid, pid, b"k"));
+        // Quit returns to normal mode and triggers a redraw.
+        assert!(server.copy_mode_step(wid, pid, b"q"));
+        let pane = server.windows.get(&wid).unwrap().panes.get(&pid).unwrap();
+        assert!(!pane.copy.active);
     }
 }

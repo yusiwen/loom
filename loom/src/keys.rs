@@ -56,6 +56,7 @@ fn binding_for(key: u8) -> Option<&'static [u8]> {
         b'k' => b"select-pane -U",
         b'l' => b"select-pane -R",
         b'z' => b"resize-pane -Z",
+        b'[' => b"copy-mode",
         _ => return None,
     })
 }
@@ -232,6 +233,7 @@ Loom keybindings (press C-b first):
   \u{22} split (top/bottom)   d detach         : command prompt
   0-9 select window   n/p next/prev window
   h/j/k/l or arrows   select pane        z zoom
+  [ copy-mode (vi keys: hjkl/w/b/v/y/q, gg/G, space/?)
   ? this help
 ";
 
@@ -284,6 +286,13 @@ mod tests {
                 "-h".into()
             ])]
         );
+    }
+
+    #[test]
+    fn prefix_open_copy_mode() {
+        // C-b [ enters copy-mode (tmux default binding).
+        let a = actions_for(&[PREFIX_KEY, b'[']);
+        assert_eq!(a, vec![Action::Command(vec!["copy-mode".into()])]);
     }
 
     #[test]

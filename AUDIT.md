@@ -374,8 +374,10 @@ Remaining follow-ups are noted under each item.
    `layout_resize` + `TIOCSWINSZ` in the `Resize` handler; layout unit tests
    cover reflow.
 8. all unit + golden tests pass — ✅ `cargo test --workspace` green
-   (95 passed, 0 failures, 0 warnings in this sandbox; +10 keybinding
-   state-machine tests and +2 status-line tests added in Phase B round 1).
+   (103 passed, 0 failures, 0 warnings in this sandbox; +10 keybinding
+   state-machine tests and +2 status-line tests added in Phase B round 1,
+   +8 in round 2: CopyMode state, selection extraction, copy-mode key
+   handling, copy-mode rendering, prefix `[` binding).
 
 Note: KPIs 1, 2, 6 are exercised by `tests/interactive_smoke.rs`, which spawns a
 real PTY + shell and drives the wire protocol. It **skips itself** in sandboxes
@@ -389,7 +391,7 @@ to execute it.
 | B1 | Prefix key (C-b) + keybinding table with multiple modes (prefix, copy, command) | `key-bindings.c`, `key-string.c`, `input-keys.c`; minimal set: `c` new-window, `&` kill-window, `%`/`"` split, `arrows`/`hjkl` select-pane, `z` zoom, `d` detach, `[` copy-mode, `:` command prompt | ✅ (copy-mode left for B4) |
 | B2 | Route server commands through `Registry` + `CmdQueue` + nom parser; delete the `match argv[0]` block | done in-server: `match argv[0]` replaced by a static `OnceLock` dispatch table (`command_registry` → 15 `fn cmd_*` handlers, 27 names/aliases); adds `list-windows`, `list-panes`, `swap-pane`, `list-clients`, `show-options`, `run-shell`. The separate `loom-commands` crate (Registry/CmdQueue/nom parser + pure command stubs) stays available for standalone use; wiring it to the live `Server` (full context: pty, clients, broadcast) is deferred to a later round | ✅ |
 | B3 | Status line: reserve bottom row, `#{}`-driven session/window/pane bar, style from options | `status.c`, `format-draw.c` | ✅ |
-| B4 | Copy mode with vi keybindings over grid history | `window-copy.c` | |
+| B4 | Copy mode with vi keybindings over grid history | `window-copy.c` | ✅ (round 2) |
 | B5 | Mouse: pane focus, split drag, scroll in copy mode | `window-panes.c` mouse parts | |
 | B6 | Bell / activity flags on windows + status markers | `alerts.c` | ✅ (bell) |
 | B7 | Window titles via OSC 0/2 | `input.c` OSC | ✅ |
@@ -452,8 +454,32 @@ to execute it.
   and calls the matching handler. 15 handler methods cover 27 name/alias
   entries. Adding a new command = one `fn cmd_*` + one `m.insert(...)`.
   Three new commands: `list-clients`, `show-options`, `run-shell`.
-- Not covered yet: B4 copy-mode, B5 mouse, B8 option scoping; status-line
-  styling is still hardcoded (no options plumbing, B8).
+
+**Implementation notes (Phase B, round 2 — B4 copy mode)**
+
+- **Copy-mode state** — `CopyMode` struct in `loom-core::session`
+  (`active`, `scroll`, `cx`/`cy`, `visual`, `sel_anchor`, `last_g`), held per
+  pane as `WindowPane::copy`. Selection endpoints are absolute grid line/col,
+  so they stay valid while the view scrolls.
+- **Server key routing** — the `KeyPress` arm of `handle_client_event` now
+  resolves the active pane first; when it is in copy mode the key is
+  consumed by `copy_mode_key` → `step_copy_mode` (vi-style: `hjkl`/arrows,
+  `w`/`b` word jumps, `0`/`$` line edges, `gg`/`G` top/bottom, `space`/`?`
+  page, `v` toggle selection, `y` yank, `q`/Esc quit) instead of being
+  written to the PTY. Only real state changes trigger a broadcast redraw.
+- **Yank + paste** — `y` extracts the selection via `Grid::extract_selection`
+  into the server's `paste_buffer`; `paste-buffer` writes it to the active
+  pane's PTY.
+- **Rendering** — `redraw::draw_all_panes` renders copy-mode panes through
+  `draw_copy_line` (grid row at `hsize - scroll + view_y`, selected cells get
+  `GRID_ATTR_REVERSE`); `position_cursor` uses the copy cursor while active.
+  Non-copy panes keep the fast `tty_draw_line` path, so golden tests are
+  untouched.
+- **Client** — `C-b [` binds to `copy-mode` in `keys.rs` (new `binding_for`
+  entry + help text + test).
+- Not covered yet: B5 mouse, B8 option scoping; status-line styling is still
+  hardcoded (B8). Copy-mode is vi-keys-only (no emacs mode, no search mode,
+  no paste into the buffer from outside the server yet).
 
 ### Phase C — parity & hardening (P2 +)
 
