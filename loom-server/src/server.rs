@@ -944,6 +944,8 @@ impl Server {
             m.insert("select-layout", Self::cmd_select_layout);
             m.insert("choose-window", Self::cmd_choose_window);
             m.insert("choose-session", Self::cmd_choose_session);
+            m.insert("rename-window", Self::cmd_rename_window);
+            m.insert("rename-session", Self::cmd_rename_session);
             m.insert("kill-pane", Self::cmd_kill_pane);
             m.insert("swap-pane", Self::cmd_swap_pane);
             m.insert("list-panes", Self::cmd_list_panes);
@@ -1536,6 +1538,41 @@ impl Server {
                 argv: vec![";".into(), response],
             },
         )?;
+        Ok(())
+    }
+
+    /// rename-window <name> — rename the current window.
+    fn cmd_rename_window(&mut self, token: Token, args: &[String]) -> io::Result<()> {
+        let new_name = args.join(" ");
+        if new_name.is_empty() {
+            return Ok(());
+        }
+        if let Some(sid) = self.clients.get(&token).and_then(|c| c.session_id) {
+            if let Some(wl) = self.sessions.get(&sid).and_then(|s| s.current_winlink()) {
+                let wid = wl.window_id;
+                if let Some(w) = self.windows.get_mut(&wid) {
+                    w.name = new_name.clone();
+                }
+                self.broadcast_redraw(sid, wid, false);
+            }
+        }
+        Ok(())
+    }
+
+    /// rename-session <name> — rename the current session.
+    fn cmd_rename_session(&mut self, token: Token, args: &[String]) -> io::Result<()> {
+        let new_name = args.join(" ");
+        if new_name.is_empty() {
+            return Ok(());
+        }
+        if let Some(sid) = self.clients.get(&token).and_then(|c| c.session_id) {
+            if let Some(s) = self.sessions.get_mut(&sid) {
+                s.name = new_name.clone();
+            }
+            if let Some(wl) = self.sessions.get(&sid).and_then(|s| s.current_winlink()) {
+                self.broadcast_redraw(sid, wl.window_id, false);
+            }
+        }
         Ok(())
     }
 
