@@ -10,9 +10,9 @@ pub type WindowId = u32;
 pub type PaneId = u32;
 pub type LayoutCellIdx = usize;
 
-/// Id generators. For the moment the server is single-threaded, but these use
-/// atomics so the core stays sound if a future round parallelizes dispatch
-/// (Phase C: replace `static mut` with `AtomicU32`).
+/// Id generators. The server is single-threaded today, but these use atomics
+/// (Phase C: replaced the old `static mut` counters) so the core stays sound
+/// if a future round parallelizes dispatch.
 static NEXT_SESSION_ID: AtomicU32 = AtomicU32::new(0);
 static NEXT_WINDOW_ID: AtomicU32 = AtomicU32::new(0);
 static NEXT_PANE_ID: AtomicU32 = AtomicU32::new(0);
