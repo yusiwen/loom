@@ -560,7 +560,8 @@ to execute it.
 
 - Hooks/events, paste buffer, control mode (`-CC`), choose-tree, popups.
   *paste buffer done* (B4 yank + `paste-buffer`/`set-buffer`/`show-buffer`);
-  `-CC` control mode, `choose-tree`, popups, hooks still open.
+  *hooks done* (set-hook/show-hooks + session-created/closed, pane-created
+  firing); `-CC` control mode, full `choose-tree` UI, popups still open.
 - `static mut` → `AtomicU32`; remove `catch_unwind`; token reuse. ✅
   (id counters now `AtomicU32`, no `static mut`/`catch_unwind` in project
   code; token allocation is monotonic-unique so no reuse is needed.)
@@ -572,10 +573,9 @@ to execute it.
 - Layouts: tiled / main-vertical / main-horizontal / even-* + `select-layout`.
   ✅ (as of round 6) — `layout::LayoutPreset` + `layout_preset` + the
   `select-layout` command.
-- Command additions (round 6): `set-buffer`, `show-buffer`,
-  `display-message`.
-- Hooks (round 6): `set-hook` / `show-hooks` register and list server-side
-  event hooks; lifecycle firing is wired behind the registry.
+- Command additions: `set-buffer`, `show-buffer`, `display-message` (round
+  6); `choose-window`, `choose-session` (round 7) — the non-interactive
+  `-t`-target forms; `set-hook`, `show-hooks` (round 6/7).
 - Bump deps (bincode 3, nix 0.31, nom 8) once stable — left; risk of
   breaking the wire protocol / nix fd APIs outweighs the benefit until a
   quiet window.
