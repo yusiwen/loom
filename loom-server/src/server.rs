@@ -999,12 +999,14 @@ impl Server {
         if let Some(client) = self.clients.get_mut(&token) {
             client.session_id = Some(sid);
         }
+        self.fire_hook("session-created");
         Ok(())
     }
 
     fn cmd_kill_session(&mut self, token: Token, _args: &[String]) -> io::Result<()> {
         if let Some(client) = self.clients.get(&token) {
             if let Some(sid) = client.session_id {
+                self.fire_hook("session-closed");
                 self.kill_session(sid);
                 if let Some(c) = self.clients.get_mut(&token) {
                     c.session_id = None;
@@ -2084,6 +2086,7 @@ impl Server {
                         pane.options.set_parent(window_opts);
                     }
                 }
+                self.fire_hook("pane-created");
                 Some(master_fd)
             }
             Err(e) => {
@@ -2125,6 +2128,18 @@ impl Server {
             },
         )?;
         Ok(())
+    }
+
+    /// Run the command registered for hook `name`, if any (Phase C).
+    fn fire_hook(&self, name: &str) {
+        if let Some(cmd) = self.hooks.get(name) {
+            if !cmd.is_empty() {
+                let _ = std::process::Command::new("/bin/sh")
+                    .arg("-c")
+                    .arg(cmd)
+                    .output();
+            }
+        }
     }
 }
 
