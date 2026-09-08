@@ -559,11 +559,31 @@ to execute it.
 ### Phase C — parity & hardening (P2 +)
 
 - Hooks/events, paste buffer, control mode (`-CC`), choose-tree, popups.
-- `static mut` → `AtomicU32`; remove `catch_unwind`; token reuse.
+  *paste buffer done* (B4 yank + `paste-buffer`/`set-buffer`/`show-buffer`);
+  `-CC` control mode, `choose-tree`, popups, hooks still open.
+- `static mut` → `AtomicU32`; remove `catch_unwind`; token reuse. ✅
+  (id counters now `AtomicU32`, no `static mut`/`catch_unwind` in project
+  code; token allocation is monotonic-unique so no reuse is needed.)
 - Portability: replace `accept4` with portable path (mio `UnixListener`),
-  honour `socket_mode`, drop Linux-only assumptions or gate with cfg.
+  honour `socket_mode`, drop Linux-only assumptions or gate with cfg. ✅ (as
+  of round 6) — create_socket uses `UnixListener::bind` + `set_nonblocking`,
+  `socket_mode` is applied via `set_permissions`, no `accept4`/`cfg(target)`
+  Linux-only path remains.
 - Layouts: tiled / main-vertical / main-horizontal / even-* + `select-layout`.
-- Bump deps (bincode 3, nix 0.31, nom 8) once stable.
+  ✅ (as of round 6) — `layout::LayoutPreset` + `layout_preset` + the
+  `select-layout` command.
+- Command additions (round 6): `set-buffer`, `show-buffer`,
+  `display-message`.
+- Bump deps (bincode 3, nix 0.31, nom 8) once stable — left; risk of
+  breaking the wire protocol / nix fd APIs outweighs the benefit until a
+  quiet window.
+
+**Phase C round-6 notes**
+
+- Atomic id counters, layout presets + `select-layout`, and the three
+  commands above landed; all 121 tests green, goldens untouched, 0 warnings.
+- Still open: `-CC` control mode, `choose-tree`, popups, event hooks, dep
+  bumps.
 
 ### Suggested ordering rationale
 
