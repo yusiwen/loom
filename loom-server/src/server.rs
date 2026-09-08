@@ -942,6 +942,8 @@ impl Server {
             m.insert("select-pane", Self::cmd_select_pane);
             m.insert("resize-pane", Self::cmd_resize_pane);
             m.insert("select-layout", Self::cmd_select_layout);
+            m.insert("choose-window", Self::cmd_choose_window);
+            m.insert("choose-session", Self::cmd_choose_session);
             m.insert("kill-pane", Self::cmd_kill_pane);
             m.insert("swap-pane", Self::cmd_swap_pane);
             m.insert("list-panes", Self::cmd_list_panes);
@@ -1463,12 +1465,60 @@ impl Server {
         Ok(())
     }
 
+    /// choose-window [-t target] — select a window in the current session
+    /// (tmux choose-window; non-interactive, acts on an explicit target or
+    /// the active window's session). The `-t N` form selects window N.
+    fn cmd_choose_window(&mut self, token: Token, args: &[String]) -> io::Result<()> {
+        let mut target: Option<String> = None;
+        let mut i = 0;
+        while i < args.len() {
+            if args[i] == "-t" && i + 1 < args.len() {
+                target = Some(args[i + 1].clone());
+                i += 2;
+            } else {
+                target = Some(args[i].clone());
+                i += 1;
+            }
+        }
+        if let Some(client) = self.clients.get(&token) {
+            if let Some(sid) = client.session_id {
+                select_window_in(self, sid, target);
+            }
+        }
+        Ok(())
+    }
+
+    /// choose-session [-t target] — point the client at a session by name or
+    /// id (non-interactive fallback for tmux choose-session).
+    fn cmd_choose_session(&mut self, token: Token, args: &[String]) -> io::Result<()> {
+        let target = args
+            .iter()
+            .find_map(|a| a.strip_prefix("-t").map(|s| if s.is_empty() { a } else { s }))
+            .or_else(|| args.first().map(|s| s.as_str()));
+        let sid = match target {
+            Some(t) => self
+                .sessions
+                .values()
+                .find(|s| s.name == t || s.id.to_string() == t)
+                .map(|s| s.id),
+            None => self.sessions.keys().max().copied(),
+        };
+        if let Some(sid) = sid {
+            if let Some(client) = self.clients.get_mut(&token) {
+                client.session_id = Some(sid);
+            }
+        }
+        Ok(())
+    }
+
     fn cmd_list_clients(&mut self, token: Token, _args: &[String]) -> io::Result<()> {
         let lines: Vec<String> = self
             .clients
             .iter()
             .map(|(t, c)| {
-                let sid = c.session_id.map(|id| id.to_string()).unwrap_or_else(|| "-".to_string());
+                let sid = c.session_id
+                    .map(|id| id.to_string())
+                    .unwrap_or_else(|| "-".to_string());
                 format!(
                     "client {:?} session={} term={} attached={}",
                     t,
@@ -2411,6 +2461,56 @@ fn word_backward(grid: &Grid, line: u32, x: u32, sx: u32) -> (u32, u32) {
     }
 }
 
+/// Select a window by index or name within `sid` (used by choose-window).
+/// Returns true on success.
+fn select_window_in(server: &mut Server, sid: SessionId, target: Option<String>) -> bool {
+    let idx: Option<i32> = {
+        let session = match server.sessions.get(&sid) {
+            Some(s) => s,
+            None => return false,
+        };
+        match target.as_deref() {
+            Some(t) => {
+                // Prefer a numeric index, else find by window name.
+                if let Ok(n) = t.parse::<i32>() {
+                    Some(n)
+                } else {
+                    session
+                        .windows
+                        .iter()
+                        .find(|(_, w)| server.windows.get(&w.window_id).map(|win| win.name == t).unwrap_or(false))
+                        .map(|(i, _)| *i)
+                }
+            }
+            None => session.curw_idx,
+        }
+    };
+    if let Some(idx) = idx {
+        let exists = server
+            .sessions
+            .get(&sid)
+            .map(|s| s.windows.contains_key(&idx))
+            .unwrap_or(false);
+        if exists {
+            if let Some(session) = server.sessions.get_mut(&sid) {
+                session.set_current_window(idx);
+                for wl in session.windows.values_mut() {
+                    wl.flags &= !WINLINK_ALERTFLAGS;
+                }
+            }
+            if let Some(wl) = server.sessions.get(&sid).and_then(|s| s.current_winlink()) {
+                let wid = wl.window_id;
+                if let Some(w) = server.windows.get_mut(&wid) {
+                    w.flags &= !(WINDOW_BELL | WINDOW_ACTIVITY);
+                }
+                server.broadcast_redraw(sid, wid, true);
+            }
+            return true;
+        }
+    }
+    false
+}
+
 /// Find the pane under a 0-based window-grid cell (mx, my), if any.
 fn pane_at(window: &Window, mx: u32, my: u32) -> Option<PaneId> {
     for (pid, p) in &window.panes {
@@ -2695,5 +2795,38 @@ mod tests {
         assert_eq!(server.hooks.get("session-created").map(String::as_str), Some("echo hi"));
         server.cmd_set_hook(Token(9999), &["session-created".into(), "".into()]).unwrap();
         assert!(server.hooks.is_empty());
+    }
+
+    /// Phase C: `select_window_in` switches the session's current window by
+    /// numeric index and clears alert flags on the selected window.
+    #[test]
+    fn test_select_window_in_by_index() {
+        let config = ServerConfig {
+            socket_path: format!("/tmp/loom-choose-{}.sock", std::process::id()),
+            socket_mode: 0o600,
+        };
+        let mut server = Server::new(config).unwrap();
+        let mut session = Session::new(Some("main"), "/tmp");
+        let wid0 = {
+            let w = Window::new(80, 24);
+            let id = w.id;
+            server.windows.insert(id, w);
+            id
+        };
+        let wid1 = {
+            let w = Window::new(80, 24);
+            let id = w.id;
+            server.windows.insert(id, w);
+            id
+        };
+        session.attach_window(0, wid0);
+        session.attach_window(1, wid1);
+        let sid = session.id;
+        server.sessions.insert(sid, session);
+
+        assert_eq!(server.sessions.get(&sid).unwrap().curw_idx, Some(1));
+        assert!(select_window_in(&mut server, sid, Some("0".to_string())));
+        assert_eq!(server.sessions.get(&sid).unwrap().curw_idx, Some(0));
+        assert!(!select_window_in(&mut server, sid, Some("99".to_string())));
     }
 }
