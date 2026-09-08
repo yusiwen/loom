@@ -197,6 +197,14 @@ fn connect_and_run(socket_path: &str, cmd_args: &[String]) -> io::Result<()> {
     send_msg(&mut peer, &Message::Resize { sx, sy })?;
     peer.flush().ok();
 
+    // (Phase C) Control mode: `-CC` makes the client a control client — it
+    // reads command lines from stdin and writes `%`-prefixed responses to
+    // stdout, with no raw mode / rendering.
+    if cmd_args.iter().any(|a| a == "-CC") {
+        loom_core::log_info!(log, "ctrl", "entering control mode (-CC)");
+        return run_control(&mut peer, log);
+    }
+
     let is_attach = if cmd_args.is_empty() || cmd_args[0] == "attach" || cmd_args[0] == "attach-session" {
         // (B1) Attach to an existing session when one exists; only create a
         // new session when there is none.
@@ -453,6 +461,94 @@ fn run_attached(peer: &mut Peer, log: Option<Logger>) -> io::Result<()> {
                     if event.is_writable() {
                         if peer.has_pending_writes() {
                             let _ = peer.flush();
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+/// Control mode (`-CC`): read command lines from stdin, forward each to the
+/// server as a `Command`, and print `%`-prefixed responses to stdout. No raw
+/// mode, no rendering — used for embedding loom (tmux control mode, Phase C).
+fn run_control(peer: &mut Peer, log: Option<Logger>) -> io::Result<()> {
+    let mut poll = Poll::new()?;
+    let mut events = Events::with_capacity(1024);
+    let mut stdin_source = SourceFd(&0);
+    poll.registry().register(&mut stdin_source, STDIN_TOKEN, Interest::READABLE)?;
+    peer.register(poll.registry(), PEER_TOKEN, Interest::READABLE)?;
+
+    let mut line = Vec::new();
+    let mut last_size = get_terminal_size();
+
+    loop {
+        let size = get_terminal_size();
+        if size != last_size {
+            last_size = size;
+            let _ = send_msg(peer, &Message::Resize { sx: size.0, sy: size.1 });
+            let _ = peer.flush();
+        }
+        match poll.poll(&mut events, Some(Duration::from_millis(100))) {
+            Ok(_) => {}
+            Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        }
+        for event in &events {
+            match event.token() {
+                STDIN_TOKEN => {
+                    let mut buf = [0u8; 256];
+                    match nix::unistd::read(0, &mut buf) {
+                        Ok(0) => return Ok(()), // stdin EOF: exit
+                        Ok(n) => {
+                            for &b in &buf[..n] {
+                                if b == b'\n' || b == b'\r' {
+                                    if !line.is_empty() {
+                                        let argv: Vec<String> = String::from_utf8_lossy(&line)
+                                            .split_whitespace()
+                                            .map(|s| s.to_string())
+                                            .collect();
+                                        line.clear();
+                                        if argv.first().map(|s| s.as_str()) == Some("quit") {
+                                            return Ok(());
+                                        }
+                                        let _ = send_msg(peer, &Message::Command {
+                                            argc: argv.len() as u32,
+                                            argv,
+                                        });
+                                        let _ = peer.flush();
+                                    }
+                                } else {
+                                    line.push(b);
+                                }
+                            }
+                        }
+                        Err(nix::errno::Errno::EAGAIN) => {}
+                        Err(e) => {
+                            loom_core::log_error!(log, "ctrl", "stdin read error: {}", e);
+                            return Ok(());
+                        }
+                    }
+                }
+                PEER_TOKEN => {
+                    if event.is_readable() {
+                        match peer.recv() {
+                            Ok(Some(Message::Command { argv, .. })) => {
+                                if argv.first().map(|s| s.as_str()) == Some(";") {
+                                    let text = argv.get(1).cloned().unwrap_or_default();
+                                    let _ = io::stdout().write_all(text.as_bytes());
+                                    let _ = io::stdout().write_all(b"\n");
+                                    let _ = io::stdout().flush();
+                                }
+                            }
+                            Ok(Some(Message::Exit)) => return Ok(()),
+                            Ok(Some(_)) => {}
+                            Ok(None) => {}
+                            Err(e) => {
+                                loom_core::log_error!(log, "ctrl", "recv error: {}", e);
+                                return Ok(());
+                            }
                         }
                     }
                 }
