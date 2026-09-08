@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, VecDeque};
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use crate::options::Options;
 use crate::screen::Screen;
@@ -9,22 +10,25 @@ pub type WindowId = u32;
 pub type PaneId = u32;
 pub type LayoutCellIdx = usize;
 
-static mut NEXT_SESSION_ID: SessionId = 0;
-static mut NEXT_WINDOW_ID: WindowId = 0;
-static mut NEXT_PANE_ID: PaneId = 0;
-static mut NEXT_ACTIVE_POINT: u32 = 0;
+/// Id generators. For the moment the server is single-threaded, but these use
+/// atomics so the core stays sound if a future round parallelizes dispatch
+/// (Phase C: replace `static mut` with `AtomicU32`).
+static NEXT_SESSION_ID: AtomicU32 = AtomicU32::new(0);
+static NEXT_WINDOW_ID: AtomicU32 = AtomicU32::new(0);
+static NEXT_PANE_ID: AtomicU32 = AtomicU32::new(0);
+static NEXT_ACTIVE_POINT: AtomicU32 = AtomicU32::new(0);
 
 pub fn next_session_id() -> SessionId {
-    unsafe { let id = NEXT_SESSION_ID; NEXT_SESSION_ID += 1; id }
+    NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed)
 }
 pub fn next_window_id() -> WindowId {
-    unsafe { let id = NEXT_WINDOW_ID; NEXT_WINDOW_ID += 1; id }
+    NEXT_WINDOW_ID.fetch_add(1, Ordering::Relaxed)
 }
 pub fn next_pane_id() -> PaneId {
-    unsafe { let id = NEXT_PANE_ID; NEXT_PANE_ID += 1; id }
+    NEXT_PANE_ID.fetch_add(1, Ordering::Relaxed)
 }
 pub fn next_active_point() -> u32 {
-    unsafe { let id = NEXT_ACTIVE_POINT; NEXT_ACTIVE_POINT += 1; id }
+    NEXT_ACTIVE_POINT.fetch_add(1, Ordering::Relaxed)
 }
 
 /// ── Pane flags ──

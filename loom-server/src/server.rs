@@ -938,6 +938,7 @@ impl Server {
             m.insert("split", Self::cmd_split_window);
             m.insert("select-pane", Self::cmd_select_pane);
             m.insert("resize-pane", Self::cmd_resize_pane);
+            m.insert("select-layout", Self::cmd_select_layout);
             m.insert("kill-pane", Self::cmd_kill_pane);
             m.insert("swap-pane", Self::cmd_swap_pane);
             m.insert("list-panes", Self::cmd_list_panes);
@@ -1210,6 +1211,80 @@ impl Server {
                                 self.broadcast_redraw(sid, wid, true);
                             }
                         }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// select-layout <name> — apply a named layout preset to the active
+    /// window (tmux: even-horizontal, even-vertical, main-horizontal,
+    /// main-vertical, tiled).
+    fn cmd_select_layout(&mut self, token: Token, args: &[String]) -> io::Result<()> {
+        let name = match args.first() {
+            Some(n) => n.as_str(),
+            None => {
+                self.send_to(
+                    token,
+                    &Message::Command {
+                        argc: 0,
+                        argv: vec![";".into(), "usage: select-layout <name>".into()],
+                    },
+                )?;
+                return Ok(());
+            }
+        };
+        let preset = match layout::LayoutPreset::parse(name) {
+            Some(p) => p,
+            None => {
+                self.send_to(
+                    token,
+                    &Message::Command {
+                        argc: 0,
+                        argv: vec![";".into(), format!("unknown layout: {}", name)],
+                    },
+                )?;
+                return Ok(());
+            }
+        };
+        if let Some(client) = self.clients.get(&token) {
+            if let Some(sid) = client.session_id {
+                if let Some(wl) = self.sessions.get(&sid).and_then(|s| s.current_winlink()) {
+                    let wid = wl.window_id;
+                    // Snapshot pane sizes + fds to reflow PTYs after the layout.
+                    let sizes: Vec<(RawFd, u32, u32)> = {
+                        let mut out = Vec::new();
+                        if let Some(w) = self.windows.get(&wid) {
+                            for p in w.panes.values() {
+                                if let Some(fd) = p.fd {
+                                    out.push((fd, p.sx, p.sy));
+                                }
+                            }
+                        }
+                        out
+                    };
+                    let ok = if let Some(w) = self.windows.get_mut(&wid) {
+                        layout::layout_preset(w, preset)
+                    } else {
+                        false
+                    };
+                    if ok {
+                        // Reflow each PTY to its new pane size.
+                        for (fd, px, py) in self
+                            .windows
+                            .get(&wid)
+                            .map(|w| {
+                                w.panes
+                                    .values()
+                                    .filter_map(|p| p.fd.map(|fd| (fd, p.sx, p.sy)))
+                                    .collect::<Vec<_>>()
+                            })
+                            .unwrap_or(sizes)
+                        {
+                            set_pty_size(fd, px, py);
+                        }
+                        self.broadcast_redraw(sid, wid, true);
                     }
                 }
             }
@@ -2469,5 +2544,32 @@ mod tests {
         assert_eq!(server.global_options.get_number("history-limit"), 2000);
         server.global_options.set_value("history-limit", "500");
         assert_eq!(server.global_options.get_number("history-limit"), 500);
+    }
+
+    /// Phase C: named layout presets redistribute pane geometry.
+    #[test]
+    fn test_layout_preset_even_horizontal() {
+        let (mut server, wid, p1id, p2id) = server_with_two_panes();
+        let w = server.windows.get_mut(&wid).unwrap();
+        assert!(layout::layout_preset(w, layout::LayoutPreset::EvenHorizontal));
+        // Two panes each get half the width (40), full height (24).
+        assert_eq!(w.panes.get(&p1id).unwrap().sx, 40);
+        assert_eq!(w.panes.get(&p1id).unwrap().xoff, 0);
+        assert_eq!(w.panes.get(&p2id).unwrap().sx, 40);
+        assert_eq!(w.panes.get(&p2id).unwrap().xoff, 40);
+        assert_eq!(w.panes.get(&p2id).unwrap().yoff, 0);
+    }
+
+    /// Phase C: a named preset re-points pane.layout_cell and reflows.
+    #[test]
+    fn test_layout_preset_even_vertical() {
+        let (mut server, wid, p1id, _p2id) = server_with_two_panes();
+        let w = server.windows.get_mut(&wid).unwrap();
+        assert!(layout::layout_preset(w, layout::LayoutPreset::EvenVertical));
+        assert_eq!(w.panes.get(&p1id).unwrap().sy, 12);
+        assert_eq!(w.panes.get(&p1id).unwrap().yoff, 0);
+        assert_eq!(w.panes.get(&_p2id).unwrap().sy, 12);
+        assert_eq!(w.panes.get(&_p2id).unwrap().yoff, 12);
+        assert!(w.panes.get(&p1id).unwrap().layout_cell.is_some());
     }
 }

@@ -1,5 +1,139 @@
 use loom_core::session::{LayoutCell, LayoutCellIdx, LayoutType, PaneId, Window, WINDOW_ZOOMED};
 
+/// Named layout presets recognised by `select-layout` (Phase C).
+pub enum LayoutPreset {
+    EvenHorizontal,
+    EvenVertical,
+    MainHorizontal,
+    MainVertical,
+    Tiled,
+}
+
+impl LayoutPreset {
+    pub fn parse(name: &str) -> Option<Self> {
+        Some(match name {
+            "even-horizontal" => LayoutPreset::EvenHorizontal,
+            "even-vertical" => LayoutPreset::EvenVertical,
+            "main-horizontal" => LayoutPreset::MainHorizontal,
+            "main-vertical" => LayoutPreset::MainVertical,
+            "tiled" => LayoutPreset::Tiled,
+            _ => return None,
+        })
+    }
+}
+
+/// Rebuild the window's layout tree to match a named preset. Panes keep their
+/// identity (position is redistributed); the active pane is unchanged.
+/// Returns false if the window has no panes.
+pub fn layout_preset(window: &mut Window, preset: LayoutPreset) -> bool {
+    // Snapshot the pane ids in the window's current order.
+    let panes: Vec<PaneId> = window.pane_order.iter().copied().collect();
+    if panes.is_empty() {
+        return false;
+    }
+    let n = panes.len() as u32;
+    let (sx, sy) = (window.sx, window.sy);
+
+    window.cells.clear();
+    // Re-point `pane.layout_cell` once we know the indices below is done in
+    // the helpers; the cells themselves record the pane id.
+
+    let root_idx: usize = match preset {
+        LayoutPreset::EvenHorizontal => {
+            build_subtree(window, &panes, LayoutType::LeftRight).0
+        }
+        LayoutPreset::EvenVertical => {
+            build_subtree(window, &panes, LayoutType::TopBottom).0
+        }
+        LayoutPreset::MainVertical | LayoutPreset::MainHorizontal => {
+            let (first, rest) = panes.split_first().unwrap();
+            if rest.is_empty() {
+                assign_leaf(window, 1, *first)
+            } else {
+                let main_axis = match preset {
+                    LayoutPreset::MainVertical => LayoutType::LeftRight,
+                    _ => LayoutType::TopBottom,
+                };
+                let rest_axis = match preset {
+                    LayoutPreset::MainVertical => LayoutType::TopBottom,
+                    _ => LayoutType::LeftRight,
+                };
+                // Main pane weight = n-1, rest group weight = 1 => main takes
+                // (n-1)/n of the primary axis (2/3 for 3 panes).
+                let main_w = rest.len() as u32;
+                let first_idx = assign_leaf(window, main_w, *first);
+                let (sub_idx, _) = build_subtree(window, rest, rest_axis);
+                push_node(window, main_axis, main_w + 1, vec![first_idx, sub_idx])
+            }
+        }
+        LayoutPreset::Tiled => {
+            if n <= 1 {
+                assign_leaf(window, 1, panes[0])
+            } else {
+                // Two columns (LeftRight) split into rows (TopBottom).
+                let per = (n as usize + 1) / 2;
+                let (left, right) = panes.split_at(per);
+                let mut child_cells = Vec::new();
+                for col in [left, right] {
+                    if col.is_empty() {
+                        continue;
+                    }
+                    let (ci, w) = build_subtree(window, col, LayoutType::TopBottom);
+                    child_cells.push((ci, w));
+                }
+                let w = child_cells.iter().map(|(_, cw)| *cw).sum::<u32>().max(1);
+                let child_idx: Vec<usize> = child_cells.iter().map(|(ci, _)| *ci).collect();
+                push_node(window, LayoutType::LeftRight, w, child_idx)
+            }
+        }
+    };
+
+    window.layout_root = Some(root_idx);
+    window.flags &= !WINDOW_ZOOMED;
+    resize_cell(window, root_idx, 0, 0, sx, sy);
+    fix_layout_panes(window);
+    true
+}
+
+/// Create a leaf cell for `pane` with relative weight `w` and return its index.
+fn assign_leaf(window: &mut Window, w: u32, pane: PaneId) -> usize {
+    let idx = window.cells.len();
+    let mut cell = LayoutCell::new_leaf();
+    cell.sx = w.max(1);
+    cell.sy = w.max(1);
+    cell.pane_id = Some(pane);
+    window.cells.push(cell);
+    if let Some(p) = window.panes.get_mut(&pane) {
+        p.layout_cell = Some(idx);
+    }
+    idx
+}
+
+/// Create a split node over `child_cells` with total weight `w`.
+fn push_node(window: &mut Window, cell_type: LayoutType, w: u32, child_cells: Vec<usize>) -> usize {
+    let idx = window.cells.len();
+    let mut node = LayoutCell::new_node(cell_type);
+    for ci in &child_cells {
+        if let Some(c) = window.cells.get_mut(*ci) {
+            c.parent = Some(idx);
+        }
+        node.children.push(*ci);
+    }
+    node.sx = w.max(1);
+    node.sy = w.max(1);
+    window.cells.push(node);
+    idx
+}
+
+/// Build a subtree over `order` split along `axis`, each leaf weight 1.
+/// Returns (root_idx, total_weight).
+fn build_subtree(window: &mut Window, order: &[PaneId], axis: LayoutType) -> (usize, u32) {
+    let child_cells: Vec<usize> = order.iter().map(|&p| assign_leaf(window, 1, p)).collect();
+    let w = child_cells.len() as u32;
+    let root = push_node(window, axis, w, child_cells);
+    (root, w)
+}
+
 /// Split a pane horizontally (left/right) or vertically (top/bottom).
 pub fn layout_split_pane(
     window: &mut Window,
