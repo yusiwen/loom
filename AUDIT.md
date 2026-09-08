@@ -374,13 +374,14 @@ Remaining follow-ups are noted under each item.
    `layout_resize` + `TIOCSWINSZ` in the `Resize` handler; layout unit tests
    cover reflow.
 8. all unit + golden tests pass — ✅ `cargo test --workspace` green
-   (119 passed, 0 failures, 0 warnings in this sandbox; +10 keybinding
+   (124 passed, 0 failures, 0 warnings in this sandbox; +10 keybinding
    state-machine tests and +2 status-line tests added in Phase B round 1,
    +9 in round 2: CopyMode state, 3x selection extraction, 2x copy-mode key
    handling, copy-mode rendering, prefix `[`/`}` bindings; +6 in round 3:
    4x mouse decode, pane_at hit-testing, mouse_scroll_pane enter/exit;
    +4 in round 4: OSC title ST/BEL, DECCKM mode bit, OSC 8 hyperlink;
-   +5 in round 5: options defaults/scope tests + status-line option wiring).
+   +5 in round 5: options defaults/scope tests + status-line option wiring;
+   +5 in rounds 6–9: option/token tests, layout presets, hooks, popup render).
 
 Note: KPIs 1, 2, 6 are exercised by `tests/interactive_smoke.rs`, which spawns a
 real PTY + shell and drives the wire protocol. It **skips itself** in sandboxes
@@ -562,8 +563,9 @@ to execute it.
   *paste buffer done* (B4 yank + `paste-buffer`/`set-buffer`/`show-buffer`);
   *hooks done* (set-hook/show-hooks + session-created/closed, pane-created
   firing); *`-CC` control mode done* (round 8: client reads command lines
-  and prints replies, no attach/rendering); full interactive `choose-tree`
-  UI and popups still open.
+  and prints replies, no attach/rendering); *popups done* (round 9:
+  `display-popup`/`close-popup` + `redraw::draw_popup` centered box); the
+  full interactive `choose-tree` UI remains the one large open item.
 - `static mut` → `AtomicU32`; remove `catch_unwind`; token reuse. ✅
   (id counters now `AtomicU32`, no `static mut`/`catch_unwind` in project
   code; token allocation is monotonic-unique so no reuse is needed.)
@@ -597,8 +599,18 @@ to execute it.
   (non-interactive `-t`), `rename-window`/`rename-session`, and wired
   hook firing (session-created/closed, pane-created). All 123 tests
   green, goldens untouched, 0 warnings.
-- Still open: full interactive `choose-tree`, popups, dep bumps — each a
-  large standalone feature left for a future round.
+
+**Phase C round-9 notes**
+
+- Added popups (`display-popup`/`close-popup` + `redraw::draw_popup`) and
+  earlier in the round `set-buffer`/`show-buffer`/`display-message`,
+  `choose-window`/`choose-session`, `rename-window`/`rename-session`,
+  `set-hook`/`show-hooks`, hook firing, and the `-CC` control client.
+  All 124 tests green, goldens untouched, 0 warnings.
+- Still open: full interactive `choose-tree` UI and the dep bumps
+  (bincode 3 / nix 0.31 / nom 8) — the dep bump changes the wire-format
+  API (`bincode::serde::encode_to_vec`) and is deliberately deferred
+  until a quiet window.
 
 ### Suggested ordering rationale
 
