@@ -561,7 +561,9 @@ to execute it.
 - Hooks/events, paste buffer, control mode (`-CC`), choose-tree, popups.
   *paste buffer done* (B4 yank + `paste-buffer`/`set-buffer`/`show-buffer`);
   *hooks done* (set-hook/show-hooks + session-created/closed, pane-created
-  firing); `-CC` control mode, full `choose-tree` UI, popups still open.
+  firing); *`-CC` control mode done* (round 8: client reads command lines
+  and prints replies, no attach/rendering); full interactive `choose-tree`
+  UI and popups still open.
 - `static mut` → `AtomicU32`; remove `catch_unwind`; token reuse. ✅
   (id counters now `AtomicU32`, no `static mut`/`catch_unwind` in project
   code; token allocation is monotonic-unique so no reuse is needed.)
@@ -575,7 +577,8 @@ to execute it.
   `select-layout` command.
 - Command additions: `set-buffer`, `show-buffer`, `display-message` (round
   6); `choose-window`, `choose-session` (round 7) — the non-interactive
-  `-t`-target forms; `set-hook`, `show-hooks` (round 6/7).
+  `-t`-target forms; `set-hook`, `show-hooks` (round 6/7); `rename-window`,
+  `rename-session` (round 8).
 - Bump deps (bincode 3, nix 0.31, nom 8) once stable — left; risk of
   breaking the wire protocol / nix fd APIs outweighs the benefit until a
   quiet window.
@@ -585,8 +588,17 @@ to execute it.
 - Atomic id counters, layout presets + `select-layout`, the three
   commands above, and hook scaffolding landed; all 122 tests green,
   goldens untouched, 0 warnings.
-- Still open: `-CC` control mode, `choose-tree`, popups, event-hook firing
-  at lifecycle points, dep bumps.
+- Still open (round 6): `-CC` control mode, `choose-tree`, popups,
+  event-hook firing at lifecycle points, dep bumps.
+
+**Phase C round-8 notes**
+
+- Added `-CC` control-mode client, `choose-window`/`choose-session`
+  (non-interactive `-t`), `rename-window`/`rename-session`, and wired
+  hook firing (session-created/closed, pane-created). All 123 tests
+  green, goldens untouched, 0 warnings.
+- Still open: full interactive `choose-tree`, popups, dep bumps — each a
+  large standalone feature left for a future round.
 
 ### Suggested ordering rationale
 
