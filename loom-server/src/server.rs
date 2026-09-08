@@ -111,6 +111,8 @@ pub struct Server {
     /// Server-wide (global) options (B8). Sessions/windows/panes are child
     /// options containers that inherit from these defaults.
     global_options: Options,
+    /// Event hooks (Phase C): hook name -> command to run when it fires.
+    hooks: HashMap<String, String>,
     pub exit: bool,
 }
 
@@ -136,6 +138,7 @@ impl Server {
             parsers: HashMap::new(),
             paste_buffer: String::new(),
             global_options: Options::with_defaults(),
+            hooks: HashMap::new(),
             exit: false,
         })
     }
@@ -952,6 +955,8 @@ impl Server {
             m.insert("set-buffer", Self::cmd_set_buffer);
             m.insert("show-buffer", Self::cmd_show_buffer);
             m.insert("display-message", Self::cmd_display_message);
+            m.insert("set-hook", Self::cmd_set_hook);
+            m.insert("show-hooks", Self::cmd_show_hooks);
             m.insert("copy-mode", Self::cmd_copy_mode);
             m.insert("paste-buffer", Self::cmd_paste_buffer);
             m
@@ -1656,6 +1661,30 @@ impl Server {
         Ok(())
     }
 
+    /// set-hook <name> <command> — register a command to run when `name`
+    /// fires (Phase C). Hooks are stored server-side; firing hooks is added
+    /// as lifecyle events become relevant.
+    fn cmd_set_hook(&mut self, token: Token, args: &[String]) -> io::Result<()> {
+        if args.len() < 2 {
+            self.send_to(
+                token,
+                &Message::Command {
+                    argc: 0,
+                    argv: vec![";".into(), "usage: set-hook <name> <command>".into()],
+                },
+            )?;
+            return Ok(());
+        }
+        let name = args[0].clone();
+        let command = args[1..].join(" ");
+        if command.is_empty() {
+            self.hooks.remove(&name);
+        } else {
+            self.hooks.insert(name, command);
+        }
+        Ok(())
+    }
+
     /// Run a shell command and send its combined output back to the caller.
     /// Basic form for B2; full control-mode semantics are P2.
     fn cmd_run_shell(&mut self, token: Token, args: &[String]) -> io::Result<()> {
@@ -2076,6 +2105,25 @@ impl Server {
         if let Err(e) = client.peer.flush() {
             loom_core::log_error!(self.log, "send", "flush to token={:?} failed: {}", token, e);
         }
+        Ok(())
+    }
+
+    /// Show all registered event hooks (testable, no dispatch side effects).
+    fn cmd_show_hooks(&mut self, token: Token, _args: &[String]) -> io::Result<()> {
+        let mut lines: Vec<String> = self
+            .hooks
+            .iter()
+            .map(|(k, v)| format!("{} \"{}\"", k, v))
+            .collect();
+        lines.sort();
+        let response = lines.join("\n");
+        self.send_to(
+            token,
+            &Message::Command {
+                argc: 0,
+                argv: vec![";".into(), response],
+            },
+        )?;
         Ok(())
     }
 }
@@ -2617,5 +2665,20 @@ mod tests {
         assert_eq!(w.panes.get(&_p2id).unwrap().sy, 12);
         assert_eq!(w.panes.get(&_p2id).unwrap().yoff, 12);
         assert!(w.panes.get(&p1id).unwrap().layout_cell.is_some());
+    }
+
+    /// Phase C: `set-hook` registers a hook command; empty removes it.
+    #[test]
+    fn test_set_hook_registers_and_removes() {
+        let config = ServerConfig {
+            socket_path: format!("/tmp/loom-hook-{}.sock", std::process::id()),
+            socket_mode: 0o600,
+        };
+        let mut server = Server::new(config).unwrap();
+        assert!(server.hooks.is_empty());
+        server.cmd_set_hook(Token(9999), &["session-created".into(), "echo hi".into()]).unwrap();
+        assert_eq!(server.hooks.get("session-created").map(String::as_str), Some("echo hi"));
+        server.cmd_set_hook(Token(9999), &["session-created".into(), "".into()]).unwrap();
+        assert!(server.hooks.is_empty());
     }
 }
