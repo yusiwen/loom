@@ -46,6 +46,8 @@ pub struct Screen {
     pub tabs: Vec<bool>,
     pub sel: Option<ScreenSel>,
     pub hyperlinks: bool,
+    /// Registered OSC 8 hyperlink URIs; `GridCell.link` indexes into this.
+    pub links: Vec<String>,
     pub progress_bar: ProgressBar,
     // ── Alt-screen support ──
     pub in_alt: bool,
@@ -86,6 +88,7 @@ impl Screen {
             tabs,
             sel: None,
             hyperlinks: false,
+            links: Vec::new(),
             progress_bar: ProgressBar {
                 state: ProgressBarState::Hidden,
                 progress: 0,

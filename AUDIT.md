@@ -374,11 +374,12 @@ Remaining follow-ups are noted under each item.
    `layout_resize` + `TIOCSWINSZ` in the `Resize` handler; layout unit tests
    cover reflow.
 8. all unit + golden tests pass — ✅ `cargo test --workspace` green
-   (110 passed, 0 failures, 0 warnings in this sandbox; +10 keybinding
+   (114 passed, 0 failures, 0 warnings in this sandbox; +10 keybinding
    state-machine tests and +2 status-line tests added in Phase B round 1,
    +9 in round 2: CopyMode state, 3x selection extraction, 2x copy-mode key
    handling, copy-mode rendering, prefix `[`/`}` bindings; +6 in round 3:
-   4x mouse decode, pane_at hit-testing, mouse_scroll_pane enter/exit).
+   4x mouse decode, pane_at hit-testing, mouse_scroll_pane enter/exit;
+   +4 in round 4: OSC title ST/BEL, DECCKM mode bit, OSC 8 hyperlink).
 
 Note: KPIs 1, 2, 6 are exercised by `tests/interactive_smoke.rs`, which spawns a
 real PTY + shell and drives the wire protocol. It **skips itself** in sandboxes
@@ -509,6 +510,27 @@ to execute it.
 - Tests: `MouseDecoder` decode/partial-buffer/forward tests (client), and
   `pane_at` hit-testing + `mouse_scroll_pane` enter/exit tests (server).
   Total 110; 0 warnings.
+
+**Implementation notes (Phase B, round 4 — ZSH escape-sequence hardening)**
+
+- **OSC ST terminator** — `Parser` now tracks the pending string kind
+  (`string_kind`) so a string finalised by `ESC \` (ST) — the standard
+  terminator — is handled, previously only BEL (`\x07`, a non-standard
+  shortcut) ran `handle_osc_finish`. `handle_esc_dispatch` on `0x5c` now
+  routes OSC/APC/Rename/DCS ST termination to the right finaliser, and
+  `string_kind` is cleared on any exit to Ground (also covers CAN/SUB).
+  Window titles emitted as `\x1b]0;title\x1b\` now set the title.
+- **DECCKM (`?1 h/l`)** — application cursor-key mode is now recorded as
+  `screen.mode` bit 2, so a full-screen app's SS3 arrows (`ESC O A/B/C/D`)
+  are not conflated with CSI cursor keys.
+- **OSC 8 hyperlink** — `Screen` gained a `links: Vec<String>` registry;
+  `Parser` tracks `active_link`; `write_char` stamps `GridCell.link` with
+  the active URI. `\x1b]8;[params];uri\x1b\` opens, `\x1b]8;;\x1b\` closes
+  (empty URI). Cell `link` is a 1-based index into `Screen::links`.
+- Still not handled (deferred, harmless): OSC 10/11 colour query responses,
+  OSC 52/133 shell integration, G1/DEC special graphics charset.
+- Tests: OSC title (BEL + ST), DECCKM mode bit, OSC 8 hyperlink open/close.
+  Total 114; 0 warnings.
 
 ### Phase C — parity & hardening (P2 +)
 

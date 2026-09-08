@@ -65,6 +65,16 @@ enum CsiType {
 
 // ── Persistent parser (owned, no lifetime) ──
 
+/// Tracks which string body is awaiting its ST (`ESC \`) terminator. Used so
+/// that a string terminated by ST — not just BEL — is finalized correctly.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StringKind {
+    Osc,
+    Apc,
+    Rename,
+    Dcs,
+}
+
 pub struct Parser {
     pub state: InputState,
     interm_buf: [u8; 4],
@@ -86,6 +96,10 @@ pub struct Parser {
     /// Set when parsing modified the screen (content, cursor, scroll, attrs).
     /// Used by the server to skip redraws for query-only sequences (DSR/DA).
     dirty: bool,
+    /// The string body being collected, if any, awaiting its terminator.
+    string_kind: Option<StringKind>,
+    /// Active OSC 8 hyperlink index into `Screen::links` (`None` = no link).
+    active_link: Option<u32>,
 }
 
 impl Default for Parser {
@@ -112,6 +126,8 @@ impl Parser {
             response: Vec::new(),
             bell: false,
             dirty: false,
+            string_kind: None,
+            active_link: None,
         }
     }
 
@@ -165,15 +181,34 @@ impl Parser {
                 if let Some(next) = tr.next_state {
                     // Start a fresh body buffer when entering a string state.
                     match next {
-                        InputState::OscString
-                        | InputState::ApcString
-                        | InputState::RenameString
-                        | InputState::DcsHandler => {
+                        InputState::OscString => {
                             self.input_buf.clear();
+                            self.string_kind = Some(StringKind::Osc);
+                        }
+                        InputState::ApcString => {
+                            self.input_buf.clear();
+                            self.string_kind = Some(StringKind::Apc);
+                        }
+                        InputState::RenameString => {
+                            self.input_buf.clear();
+                            self.string_kind = Some(StringKind::Rename);
+                        }
+                        InputState::DcsHandler => {
+                            self.input_buf.clear();
+                            self.string_kind = Some(StringKind::Dcs);
                         }
                         _ => {}
                     }
                     self.state = next;
+                    // Leaving to a non-string state drops the pending body.
+                    if matches!(
+                        next,
+                        InputState::Ground
+                            | InputState::CsiEnter
+                            | InputState::DcsEscape
+                    ) {
+                        self.string_kind = None;
+                    }
                 }
                 return;
             }
@@ -246,7 +281,9 @@ impl Parser {
         }
 
         let data = loom_core::utf8::Utf8Data::new(c);
-        let gc = GridCell { data, ..self.cell };
+        let mut gc = GridCell { data, ..self.cell };
+        // Carry the active OSC 8 hyperlink (if any) onto the written cell.
+        gc.link = self.active_link.unwrap_or(0);
         screen.grid.view_set_cell(screen.cx, screen.cy, &gc);
         screen.cx = screen.cx.saturating_add(width);
     }
@@ -438,6 +475,19 @@ fn handle_csi_dispatch(p: &mut Parser, ch: u8, screen: &mut Screen) {
 }
 
 fn handle_esc_dispatch(p: &mut Parser, ch: u8, screen: &mut Screen) {
+    // `ESC \` (ST) terminates an in-progress string body. This is the
+    // standard terminator for OSC/APC/DCS/Rename (BEL is a non-standard
+    // shortcut that the OSC table also accepts).
+    if ch == b'\\' {
+        if let Some(kind) = p.string_kind.take() {
+            match kind {
+                StringKind::Osc => handle_osc_finish(p, ch, screen),
+                StringKind::Apc | StringKind::Rename => p.input_buf.clear(),
+                StringKind::Dcs => handle_dcs_dispatch(p, ch, screen),
+            }
+            return;
+        }
+    }
     p.dirty = true;
     dispatch_esc(p, ch, screen);
 }
@@ -461,10 +511,30 @@ fn handle_osc_finish(p: &mut Parser, _ch: u8, screen: &mut Screen) {
             s.push(b as char);
         }
         let cmd: i32 = s.parse().unwrap_or(-1);
-        let title = String::from_utf8_lossy(&p.input_buf[pos + 1..]).to_string();
+        let body = String::from_utf8_lossy(&p.input_buf[pos + 1..]).to_string();
         match cmd {
             0 | 1 | 2 => {
-                screen.title = title;
+                screen.title = body;
+            }
+            8 => {
+                // OSC 8;[params];[uri] — hyperlink. An empty URI closes it.
+                // The params may be empty, so split on the second ';'.
+                let mut parts = body.splitn(2, ';');
+                let _params = parts.next().unwrap_or("");
+                let uri = parts.next().unwrap_or("");
+                if uri.is_empty() {
+                    p.active_link = None;
+                } else {
+                    let tab = &mut screen.links;
+                    let idx = tab
+                        .iter()
+                        .position(|u| u == uri)
+                        .unwrap_or_else(|| {
+                            tab.push(uri.to_string());
+                            tab.len() - 1
+                        });
+                    p.active_link = Some(idx as u32 + 1);
+                }
             }
             _ => {}
         }
@@ -831,7 +901,14 @@ fn dispatch_csi_command(p: &mut Parser, cmd: CsiType, screen: &mut Screen) {
 fn handle_private_mode(mode: i32, is_set: bool, screen: &mut Screen) {
     match mode {
         1 => {
-            // DECCKM - cursor key mode
+            // DECCKM - application cursor-key mode. Records the mode bit so a
+            // full-screen app's arrow keys (SS3 ESC O A/B/C/D) are not
+            // misinterpreted for normal CSI cursor keys.
+            if is_set {
+                screen.mode |= 1 << 2;
+            } else {
+                screen.mode &= !(1 << 2);
+            }
         }
         7 => {
             // DECAWM - auto wrap
@@ -1343,5 +1420,55 @@ mod tests {
         p.parse_buf(&mut screen, b"\x1b[3@");   // ICH 3
         let s: String = (0..14).map(|i| screen.grid.view_get_cell(i, 0).unwrap().data.to_char()).collect();
         assert_eq!(s, "   Hello World");
+    }
+
+    #[test]
+    fn test_osc_title_bel() {
+        let mut screen = Screen::new(80, 24);
+        let mut p = Parser::new();
+        // OSC 2;title BEL — the non-standard but common terminator.
+        p.parse_buf(&mut screen, b"\x1b]2;my-title\x07");
+        assert_eq!(screen.title, "my-title");
+    }
+
+    #[test]
+    fn test_osc_title_st() {
+        let mut screen = Screen::new(80, 24);
+        let mut p = Parser::new();
+        // OSC 2;title ST (ESC \) — the standard terminator. The parser must
+        // finalize the title on ST, not just on BEL.
+        p.parse_buf(&mut screen, b"\x1b]0;st-title\x1b\\");
+        assert_eq!(screen.title, "st-title");
+        // The following text must not be swallowed by a leftover style state.
+        p.parse_buf(&mut screen, b"X");
+        assert_eq!(screen.grid.view_get_cell(0, 0).unwrap().data.to_char(), 'X');
+    }
+
+    #[test]
+    fn test_decckm_mode_bit() {
+        let mut screen = Screen::new(80, 24);
+        let mut p = Parser::new();
+        // Mode 1 (DECCKM) is off by default.
+        assert_eq!(screen.mode & (1 << 2), 0);
+        p.parse_buf(&mut screen, b"\x1b[?1h");
+        assert_ne!(screen.mode & (1 << 2), 0);
+        p.parse_buf(&mut screen, b"\x1b[?1l");
+        assert_eq!(screen.mode & (1 << 2), 0);
+    }
+
+    #[test]
+    fn test_osc8_hyperlink() {
+        let mut screen = Screen::new(80, 24);
+        let mut p = Parser::new();
+        // OSC 8;params;uri ST opens a link; following text is tagged with it.
+        p.parse_buf(&mut screen, b"\x1b]8;;https://example.com\x1b\\Hi");
+        assert_eq!(screen.links, vec!["https://example.com".to_string()]);
+        let cell = screen.grid.view_get_cell(0, 0).unwrap();
+        assert_eq!(cell.data.to_char(), 'H');
+        assert_ne!(cell.link, 0);
+        // OSC 8;params; ST (empty uri) closes the link.
+        p.parse_buf(&mut screen, b"\x1b]8;;\x1b\\ ");
+        let cell = screen.grid.view_get_cell(2, 0).unwrap();
+        assert_eq!(cell.link, 0);
     }
 }
