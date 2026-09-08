@@ -113,7 +113,18 @@ pub struct Server {
     global_options: Options,
     /// Event hooks (Phase C): hook name -> command to run when it fires.
     hooks: HashMap<String, String>,
+    /// A pending popup overlay (Phase C, display-popup). When `Some`, it is
+    /// drawn over the window content on each redraw (center-aligned box).
+    popup: Option<Popup>,
     pub exit: bool,
+}
+
+/// A floating popup showing captured command output.
+struct Popup {
+    title: String,
+    lines: Vec<String>,
+    width: u32,
+    height: u32,
 }
 
 impl Server {
@@ -139,6 +150,7 @@ impl Server {
             paste_buffer: String::new(),
             global_options: Options::with_defaults(),
             hooks: HashMap::new(),
+            popup: None,
             exit: false,
         })
     }
@@ -472,6 +484,16 @@ impl Server {
                 let segments = status_segments(&self.sessions, &self.windows, sid, wid);
                 redraw::draw_status_line(tty, window, &segments);
                 redraw::position_cursor(tty, window);
+                // (Phase C) Popup overlay, if any, sits on top.
+                if let Some(popup) = &self.popup {
+                    redraw::draw_popup(
+                        tty,
+                        &popup.title,
+                        &popup.lines,
+                        popup.width,
+                        popup.height,
+                    );
+                }
                 out = tty.take_output();
             }
             out
@@ -946,6 +968,8 @@ impl Server {
             m.insert("choose-session", Self::cmd_choose_session);
             m.insert("rename-window", Self::cmd_rename_window);
             m.insert("rename-session", Self::cmd_rename_session);
+            m.insert("display-popup", Self::cmd_display_popup);
+            m.insert("close-popup", Self::cmd_close_popup);
             m.insert("kill-pane", Self::cmd_kill_pane);
             m.insert("swap-pane", Self::cmd_swap_pane);
             m.insert("list-panes", Self::cmd_list_panes);
@@ -1770,6 +1794,86 @@ impl Server {
             self.hooks.remove(&name);
         } else {
             self.hooks.insert(name, command);
+        }
+        Ok(())
+    }
+
+    /// display-popup [-w N -h N] <command> — run a command and show its
+    /// output in a centered floating box (Phase C). `close-popup` hides it.
+    fn cmd_display_popup(&mut self, token: Token, args: &[String]) -> io::Result<()> {
+        let mut width = 0u32;
+        let mut height = 0u32;
+        let mut cmd: Vec<String> = Vec::new();
+        let mut i = 0;
+        while i < args.len() {
+            match args[i].as_str() {
+                "-w" if i + 1 < args.len() => {
+                    if let Ok(n) = args[i + 1].parse() { width = n; }
+                    i += 2;
+                }
+                "-h" if i + 1 < args.len() => {
+                    if let Ok(n) = args[i + 1].parse() { height = n; }
+                    i += 2;
+                }
+                _ => { cmd.push(args[i].clone()); i += 1; }
+            }
+        }
+        if cmd.is_empty() {
+            self.send_to(
+                token,
+                &Message::Command {
+                    argc: 0,
+                    argv: vec![";".into(), "usage: display-popup [-w N -h N] <command>".into()],
+                },
+            )?;
+            return Ok(());
+        }
+        let shell_cmd = cmd.join(" ");
+        let output = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(&shell_cmd)
+            .output();
+        let text = match output {
+            Ok(o) => {
+                let mut t = String::from_utf8_lossy(&o.stdout).into_owned();
+                let err = String::from_utf8_lossy(&o.stderr);
+                if !err.is_empty() {
+                    t.push_str("\n");
+                    t.push_str(&err);
+                }
+                t
+            }
+            Err(e) => format!("display-popup failed: {}", e),
+        };
+        let lines: Vec<String> = text.lines().map(str::to_string).collect();
+        let max_lines = if height > 0 { height as usize } else { lines.len().max(1) };
+        let max_chars = if width > 0 { width as usize } else {
+            lines.iter().map(|l| l.chars().count()).max().unwrap_or(20).clamp(20, 80)
+        };
+        self.popup = Some(Popup {
+            title: shell_cmd.clone(),
+            lines: lines.into_iter().take(max_lines).collect(),
+            width: max_chars as u32,
+            height: max_lines as u32,
+        });
+        // Redraw to show the popup for the requesting client.
+        if let Some(sid) = self.clients.get(&token).and_then(|c| c.session_id) {
+            if let Some(wl) = self.sessions.get(&sid).and_then(|s| s.current_winlink()) {
+                self.broadcast_redraw(sid, wl.window_id, true);
+            }
+        }
+        Ok(())
+    }
+
+    /// close-popup — hide the current popup overlay.
+    fn cmd_close_popup(&mut self, token: Token, _args: &[String]) -> io::Result<()> {
+        if self.popup.is_some() {
+            self.popup = None;
+            if let Some(sid) = self.clients.get(&token).and_then(|c| c.session_id) {
+                if let Some(wl) = self.sessions.get(&sid).and_then(|s| s.current_winlink()) {
+                    self.broadcast_redraw(sid, wl.window_id, true);
+                }
+            }
         }
         Ok(())
     }

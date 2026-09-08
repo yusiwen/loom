@@ -193,6 +193,83 @@ pub fn render_to_buffer(window: &Window) -> Vec<u8> {
     tty.take_output()
 }
 
+/// Draw a centered popup overlay (Phase C) over the current Tty content.
+/// `title`/`lines`/`width`/`height` come from `Server::popup`; the box is
+/// drawn with reverse-video borders so it reads as an overlay. Called after
+/// the status line and content so it sits on top.
+pub fn draw_popup(
+    tty: &mut Tty,
+    title: &str,
+    lines: &[String],
+    width: u32,
+    height: u32,
+) {
+    let sw = tty.sx;
+    let sh = tty.sy.saturating_sub(1); // keep above the status row
+    let w = width.clamp(10, sw.saturating_sub(2)).max(10);
+    let h = height.clamp(3, sh.saturating_sub(2)).max(3);
+    let x0 = (sw.saturating_sub(w)) / 2;
+    let y0 = (sh.saturating_sub(h)) / 2;
+
+    let bottom_mid = '\u{2534}'; // ┴
+    let vert = '\u{2502}'; // │
+    let horiz = '\u{2500}'; // ─
+    let tl = '\u{250c}'; // ┌
+    let tr = '\u{2510}'; // ┐
+    let bl = '\u{2514}'; // └
+    let br = '\u{2518}'; // ┘
+
+    let mut put = |x: u32, y: u32, ch: char, fg: i32| {
+        let mut cell = GridCell {
+            fg: fg | 0x01000000,
+            bg: 236 | 0x01000000,
+            attr: GRID_ATTR_BRIGHT,
+            ..GridCell::default_cell()
+        };
+        cell.data = Utf8Data::new(ch);
+        tty.tty_cell(x, y, &cell);
+    };
+
+    let title_str: Vec<char> = title.chars().collect();
+    // Top border.
+    for x in 0..w {
+        let ch = if x == 0 { tl } else if x + 1 == w { tr } else { horiz };
+        put(x0 + x, y0, ch, 39);
+    }
+    // Title row (row 1): corners + title text.
+    if h >= 2 {
+        put(x0, y0 + 1, vert, 33);
+        let mut ti = 0;
+        for x in 1..w.saturating_sub(1) {
+            let ch = if ti < title_str.len() { title_str[ti] } else { ' ' };
+            put(x0 + x, y0 + 1, ch, 33);
+            ti += 1;
+        }
+        put(x0 + w - 1, y0 + 1, vert, 33);
+    }
+    // Body rows.
+    for r in 0..h.saturating_sub(2) {
+        let y = y0 + 2 + r;
+        put(x0, y, vert, 39);
+        let line = lines.get(r as usize).cloned().unwrap_or_default();
+        let mut li = 0;
+        for x in 1..w.saturating_sub(1) {
+            let ch = line.chars().nth(li).unwrap_or(' ');
+            put(x0 + x, y, ch, 39);
+            li += 1;
+        }
+        put(x0 + w - 1, y, vert, 39);
+    }
+    // Bottom border.
+    let yb = y0 + h - 1;
+    for x in 0..w {
+        let ch = if x == 0 { bl } else if x + 1 == w { br } else { bottom_mid };
+        put(x0 + x, yb, ch, 39);
+    }
+    // Reset attributes.
+    tty.tty_attributes(&GridCell::default_cell());
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -318,5 +395,20 @@ mod tests {
             s.contains("\x1b[1;5H"),
             "expected CUP to copy-mode cursor position, got: {s}"
         );
+    }
+
+    /// Phase C: draw_popup renders a centered box with a border and title,
+    /// visible in the output bytes.
+    #[test]
+    fn test_draw_popup_renders_box() {
+        let mut tty = Tty::new(80, 24);
+        let lines = vec!["hello".to_string(), "world".to_string()];
+        draw_popup(&mut tty, "title", &lines, 20, 5);
+        let s = String::from_utf8_lossy(&tty.take_output()).into_owned();
+        // Box glyphs from the Unicode box-drawing set are present.
+        assert!(s.contains('\u{250c}')); // ┌ top-left
+        assert!(s.contains('\u{2518}')); // ┘ bottom-right
+        assert!(s.contains("title"));
+        assert!(s.contains("hello"));
     }
 }
