@@ -574,16 +574,19 @@ to execute it.
   `select-layout` command.
 - Command additions (round 6): `set-buffer`, `show-buffer`,
   `display-message`.
+- Hooks (round 6): `set-hook` / `show-hooks` register and list server-side
+  event hooks; lifecycle firing is wired behind the registry.
 - Bump deps (bincode 3, nix 0.31, nom 8) once stable — left; risk of
   breaking the wire protocol / nix fd APIs outweighs the benefit until a
   quiet window.
 
 **Phase C round-6 notes**
 
-- Atomic id counters, layout presets + `select-layout`, and the three
-  commands above landed; all 121 tests green, goldens untouched, 0 warnings.
-- Still open: `-CC` control mode, `choose-tree`, popups, event hooks, dep
-  bumps.
+- Atomic id counters, layout presets + `select-layout`, the three
+  commands above, and hook scaffolding landed; all 122 tests green,
+  goldens untouched, 0 warnings.
+- Still open: `-CC` control mode, `choose-tree`, popups, event-hook firing
+  at lifecycle points, dep bumps.
 
 ### Suggested ordering rationale
 
