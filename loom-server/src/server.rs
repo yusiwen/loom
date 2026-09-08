@@ -949,6 +949,9 @@ impl Server {
             m.insert("set-option", Self::cmd_set_option);
             m.insert("set", Self::cmd_set_option);
             m.insert("run-shell", Self::cmd_run_shell);
+            m.insert("set-buffer", Self::cmd_set_buffer);
+            m.insert("show-buffer", Self::cmd_show_buffer);
+            m.insert("display-message", Self::cmd_display_message);
             m.insert("copy-mode", Self::cmd_copy_mode);
             m.insert("paste-buffer", Self::cmd_paste_buffer);
             m
@@ -1607,6 +1610,49 @@ impl Server {
         if let Some(o) = opts {
             let _ = o.set_value(&name, &value);
         }
+        Ok(())
+    }
+
+    /// set-buffer [-b name] <text> — store text in the paste buffer.
+    fn cmd_set_buffer(&mut self, _token: Token, args: &[String]) -> io::Result<()> {
+        let mut text: Vec<String> = Vec::new();
+        for a in args {
+            if let Some(v) = a.strip_prefix("-b ") {
+                text.push(v.to_string());
+            } else if a != "-b" {
+                text.push(a.clone());
+            }
+        }
+        let s = text.join(" ");
+        if !s.is_empty() {
+            self.paste_buffer = s;
+        }
+        Ok(())
+    }
+
+    /// show-buffer — return the current paste buffer contents.
+    fn cmd_show_buffer(&mut self, token: Token, _args: &[String]) -> io::Result<()> {
+        let out = self.paste_buffer.clone();
+        self.send_to(
+            token,
+            &Message::Command {
+                argc: 0,
+                argv: vec![";".into(), out],
+            },
+        )?;
+        Ok(())
+    }
+
+    /// display-message <text> — print a message to the client (echoed).
+    fn cmd_display_message(&mut self, token: Token, args: &[String]) -> io::Result<()> {
+        let text = args.join(" ");
+        self.send_to(
+            token,
+            &Message::Command {
+                argc: 0,
+                argv: vec![";".into(), text],
+            },
+        )?;
         Ok(())
     }
 
