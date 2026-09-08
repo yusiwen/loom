@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 /// Protocol version.
-pub const PROTOCOL_VERSION: u32 = 8;
+pub const PROTOCOL_VERSION: u32 = 9;
 
 /// Messages exchanged between client and server.
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -77,6 +77,8 @@ pub enum Message {
     AttachSession,
     /// Client sends a keystroke to the attached session.
     KeyPress { key: Vec<u8> },
+    /// Client sends a mouse event (SGR mouse decoded).
+    Mouse { button: u32, sx: u32, sy: u32, release: bool },
     /// Server sends screen update to the client.
     ScreenUpdate { data: Vec<u8> },
 

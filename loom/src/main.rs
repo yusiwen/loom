@@ -13,7 +13,9 @@ use loom_ipc::peer::Peer;
 use loom_server::server::{Server, ServerConfig};
 
 mod keys;
+mod mouse;
 use keys::{Action, KeyHandler};
+use mouse::MouseDecoder;
 
 const STDIN_TOKEN: Token = Token(0);
 const PEER_TOKEN: Token = Token(1);
@@ -297,6 +299,9 @@ fn run_attached(peer: &mut Peer, log: Option<Logger>) -> io::Result<()> {
     struct RawModeGuard(RawFd, termios::Termios);
     impl Drop for RawModeGuard {
         fn drop(&mut self) {
+            // Restore the terminal's drive mode and switch mouse reporting off.
+            let _ = io::stdout().write_all(b"\x1b[?1000;1002;1006l");
+            let _ = io::stdout().flush();
             let _ = termios::tcsetattr(
                 unsafe { BorrowedFd::borrow_raw(self.0) },
                 termios::SetArg::TCSANOW,
@@ -305,6 +310,11 @@ fn run_attached(peer: &mut Peer, log: Option<Logger>) -> io::Result<()> {
         }
     }
     let _guard = RawModeGuard(0, orig_tio);
+
+    // Enable SGR mouse reporting so the client can decode mouse events
+    // (B5). 1000 = button events, 1002 = button+motion (drag), 1006 = SGR.
+    let _ = io::stdout().write_all(b"\x1b[?1000;1002;1006h");
+    let _ = io::stdout().flush();
 
     let mut poll = Poll::new()?;
     let mut events = Events::with_capacity(1024);
@@ -325,6 +335,8 @@ fn run_attached(peer: &mut Peer, log: Option<Logger>) -> io::Result<()> {
     let mut last_size = (sx, sy);
     // (B1) prefix-key state machine: normal -> prefix -> (binding | prompt).
     let mut keys = KeyHandler::new();
+    // (B5) decode SGR mouse events out of the input stream.
+    let mut mouse = MouseDecoder::new();
 
     loop {
         match poll.poll(&mut events, Some(Duration::from_millis(200))) {
@@ -354,9 +366,18 @@ fn run_attached(peer: &mut Peer, log: Option<Logger>) -> io::Result<()> {
                             return Ok(());
                         }
                         Ok(n) => {
-                            // (B1) Route keystrokes through the prefix-key
-                            // state machine; only unbound keys reach the PTY.
-                            let actions = keys.feed(&buf[..n]);
+                            // (B5) Split mouse events out first; the rest are
+                            // keystrokes routed through the prefix-key machine.
+                            let (fwd, mouse_events) = mouse.feed(&buf[..n]);
+                            for ev in mouse_events {
+                                let _ = send_msg(peer, &Message::Mouse {
+                                    button: ev.button,
+                                    sx: ev.sx,
+                                    sy: ev.sy,
+                                    release: ev.release,
+                                });
+                            }
+                            let actions = keys.feed(&fwd);
                             let mut detach = false;
                             for action in actions {
                                 match action {

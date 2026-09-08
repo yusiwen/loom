@@ -866,6 +866,9 @@ impl Server {
                     }
                 }
             }
+            Message::Mouse { button, sx, sy, release } => {
+                self.handle_mouse_event(token, button, sx, sy, release);
+            }
             Message::Exit => {
                 // Client is going away. The session persists (P0-6).
                 loom_core::log_debug!(self.log, "dispatch", "Exit from token={:?}", token);
@@ -1533,6 +1536,166 @@ impl Server {
         redraw
     }
 
+    /// Handle a decoded mouse event (B5).
+    ///
+    /// Coordinates are the 1-based client terminal cell. Left press focuses
+    /// the pane under the cursor (or selects the window when the status line
+    /// is clicked). Wheel events scroll copy-mode / history on the pane under
+    /// the cursor. Clicking a window in the status bar selects it.
+    fn handle_mouse_event(&mut self, token: Token, button: u32, sx: u32, sy: u32, release: bool) {
+        if release {
+            return;
+        }
+        let sid = match self.clients.get(&token).and_then(|c| c.session_id) {
+            Some(s) => s,
+            None => return,
+        };
+        let wid = match self.sessions.get(&sid).and_then(|s| s.current_winlink()) {
+            Some(wl) => wl.window_id,
+            None => return,
+        };
+        // Convert to 0-based client cell coordinates and locate the target
+        // cell (content area or status line) within the window grid.
+        let (mx, my) = (sx.saturating_sub(1), sy.saturating_sub(1));
+        let window_sy = match self.windows.get(&wid) {
+            Some(w) => w.sy,
+            None => return,
+        };
+
+        // Status line: the bottom row(s) of the client terminal, at or below
+        // the window's content height.
+        if my >= window_sy {
+            self.select_window_at_status(token, &wid, mx);
+            return;
+        }
+
+        // Wheel events act on the pane under the cursor.
+        if button & 0x3f == 64 || button & 0x3f == 65 {
+            if let Some(pid) = self
+                .windows
+                .get(&wid)
+                .and_then(|w| pane_at(w, mx, my))
+            {
+                if self.mouse_scroll_pane(&wid, pid, button & 0x3f == 64) {
+                    self.broadcast_redraw(sid, wid, false);
+                }
+            }
+            return;
+        }
+
+        // Left button press focuses the pane under the cursor.
+        if button & 0x3f == 0 {
+            let changed = {
+                if let Some(window) = self.windows.get_mut(&wid) {
+                    if let Some(pid) = pane_at(window, mx, my) {
+                        if window.active_pane_id != Some(pid) {
+                            window.set_active_pane(pid);
+                            true
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                }
+            };
+            if changed {
+                self.broadcast_redraw(sid, wid, false);
+            }
+        }
+    }
+
+    /// Scroll a pane's copy-mode / history using the mouse wheel.
+    /// `up` is true for wheel-up (scroll into history), false for wheel-down.
+    /// If the pane is not in copy-mode, wheel-up focuses it, enters copy-mode
+    /// and scrolls up. Returns true when a client redraw is needed.
+    fn mouse_scroll_pane(&mut self, wid: &WindowId, pid: PaneId, up: bool) -> bool {
+        // Focus the pane (mutates the window) before borrowing the pane.
+        if up {
+            if let Some(window) = self.windows.get_mut(wid) {
+                if window.active_pane_id != Some(pid) {
+                    window.set_active_pane(pid);
+                }
+            }
+        }
+        let window = match self.windows.get_mut(wid) {
+            Some(w) => w,
+            None => return false,
+        };
+        let pane = match window.panes.get_mut(&pid) {
+            Some(p) => p,
+            None => return false,
+        };
+
+        if up {
+            if !pane.copy.active {
+                pane.copy.enter(pane.sx, pane.sy);
+            }
+            let hsize = pane.screen.grid.hsize;
+            if pane.copy.scroll < hsize {
+                pane.copy.scroll += 1;
+            }
+            true
+        } else if pane.copy.active {
+            if pane.copy.scroll > 0 {
+                pane.copy.scroll -= 1;
+                true
+            } else {
+                pane.copy.exit();
+                true
+            }
+        } else {
+            false
+        }
+    }
+
+    /// Select the window whose status-line entry is under column `mx`.
+    fn select_window_at_status(&mut self, token: Token, wid: &WindowId, mx: u32) {
+        let sid = match self.clients.get(&token).and_then(|c| c.session_id) {
+            Some(s) => s,
+            None => return,
+        };
+        // The status line in `status_segments` starts with the session-name
+        // segment (" name "), so account for it before the window entries.
+        let mut x: u32 = {
+            if let Some(session) = self.sessions.get(&sid) {
+                let name = if session.name.is_empty() {
+                    sid.to_string()
+                } else {
+                    session.name.clone()
+                };
+                format!(" {} ", name).chars().count() as u32
+            } else {
+                0
+            }
+        };
+        let mut target: Option<(i32, WindowId)> = None;
+        if let Some(session) = self.sessions.get(&sid) {
+            for (idx, wl) in &session.windows {
+                let name = window_display_name(&self.windows, wl.window_id);
+                let cell = format!(" {}:{} ", idx, name);
+                let width = cell.chars().count() as u32;
+                if mx >= x && mx < x + width {
+                    target = Some((*idx, wl.window_id));
+                    break;
+                }
+                x += width;
+            }
+        }
+        if let Some((idx, target_wid)) = target {
+            if let Some(session) = self.sessions.get_mut(&sid) {
+                session.set_current_window(idx);
+            }
+            // Redraw for the requesting client at the newly-selected window.
+            if *wid != target_wid {
+                let _ = self.redraw_for_client(token, target_wid, true);
+            }
+            self.broadcast_redraw(sid, target_wid, false);
+        }
+    }
+
     fn do_split_window(&mut self, token: Token, vertical: bool) -> io::Result<()> {
         if let Some(client) = self.clients.get(&token) {
             if let Some(sid) = client.session_id {
@@ -1935,6 +2098,18 @@ fn word_backward(grid: &Grid, line: u32, x: u32, sx: u32) -> (u32, u32) {
     }
 }
 
+/// Find the pane under a 0-based window-grid cell (mx, my), if any.
+fn pane_at(window: &Window, mx: u32, my: u32) -> Option<PaneId> {
+    for (pid, p) in &window.panes {
+        let x = mx as i32 - p.xoff;
+        let y = my as i32 - p.yoff;
+        if x >= 0 && y >= 0 && x < p.sx as i32 && y < p.sy as i32 {
+            return Some(*pid);
+        }
+    }
+    None
+}
+
 /// Find the pane to select when moving in direction `dir` from the active
 /// pane: the nearest pane strictly in that direction.
 fn pane_in_direction(window: &Window, dir: &str) -> Option<PaneId> {
@@ -2080,6 +2255,64 @@ mod tests {
         // Quit returns to normal mode and triggers a redraw.
         assert!(server.copy_mode_step(wid, pid, b"q"));
         let pane = server.windows.get(&wid).unwrap().panes.get(&pid).unwrap();
+        assert!(!pane.copy.active);
+    }
+
+    /// A window with two side-by-side panes (each 40x24) for hit-testing.
+    fn server_with_two_panes() -> (Server, WindowId, PaneId, PaneId) {
+        use loom_core::grid_cell::GridCell;
+        use loom_core::utf8::Utf8Data;
+
+        let config = ServerConfig {
+            socket_path: format!("/tmp/loom-mouse-{}.sock", std::process::id()),
+            socket_mode: 0o600,
+        };
+        let mut server = Server::new(config).unwrap();
+        let mut window = Window::new(80, 24);
+        let wid = window.id;
+        let mut p1 = WindowPane::new(wid, 40, 24);
+        let p1id = p1.id;
+        p1.xoff = 0;
+        p1.yoff = 0;
+        for (i, ch) in "left".chars().enumerate() {
+            p1.screen.grid.set_cell(i as u32, 0, &GridCell {
+                data: Utf8Data::new(ch),
+                ..GridCell::default_cell()
+            });
+        }
+        let mut p2 = WindowPane::new(wid, 40, 24);
+        let p2id = p2.id;
+        p2.xoff = 40;
+        p2.yoff = 0;
+        window.panes.insert(p1id, p1);
+        window.panes.insert(p2id, p2);
+        window.active_pane_id = Some(p1id);
+        window.pane_order.push_back(p1id);
+        window.pane_order.push_back(p2id);
+        server.windows.insert(wid, window);
+        (server, wid, p1id, p2id)
+    }
+
+    #[test]
+    fn test_pane_at_hit_testing() {
+        let (server, wid, p1id, p2id) = server_with_two_panes();
+        let w = server.windows.get(&wid).unwrap();
+        assert_eq!(pane_at(w, 10, 12), Some(p1id));
+        assert_eq!(pane_at(w, 50, 12), Some(p2id));
+        // Below the content area (a status row) => no pane.
+        assert_eq!(pane_at(w, 10, 24), None);
+    }
+
+    #[test]
+    fn test_mouse_wheel_enters_and_exits_copy_mode() {
+        let (mut server, wid, p1id, _p2id) = server_with_two_panes();
+        // Wheel-up on the left pane: enters copy-mode and scrolls history.
+        assert!(server.mouse_scroll_pane(&wid, p1id, true));
+        let pane = server.windows.get(&wid).unwrap().panes.get(&p1id).unwrap();
+        assert!(pane.copy.active);
+        // Wheel-down on the same pane: back to the live screen, exits.
+        assert!(server.mouse_scroll_pane(&wid, p1id, false));
+        let pane = server.windows.get(&wid).unwrap().panes.get(&p1id).unwrap();
         assert!(!pane.copy.active);
     }
 }

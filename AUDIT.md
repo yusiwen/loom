@@ -374,10 +374,11 @@ Remaining follow-ups are noted under each item.
    `layout_resize` + `TIOCSWINSZ` in the `Resize` handler; layout unit tests
    cover reflow.
 8. all unit + golden tests pass — ✅ `cargo test --workspace` green
-   (104 passed, 0 failures, 0 warnings in this sandbox; +10 keybinding
+   (110 passed, 0 failures, 0 warnings in this sandbox; +10 keybinding
    state-machine tests and +2 status-line tests added in Phase B round 1,
    +9 in round 2: CopyMode state, 3x selection extraction, 2x copy-mode key
-   handling, copy-mode rendering, prefix `[`/`}` bindings).
+   handling, copy-mode rendering, prefix `[`/`}` bindings; +6 in round 3:
+   4x mouse decode, pane_at hit-testing, mouse_scroll_pane enter/exit).
 
 Note: KPIs 1, 2, 6 are exercised by `tests/interactive_smoke.rs`, which spawns a
 real PTY + shell and drives the wire protocol. It **skips itself** in sandboxes
@@ -392,7 +393,7 @@ to execute it.
 | B2 | Route server commands through `Registry` + `CmdQueue` + nom parser; delete the `match argv[0]` block | done in-server: `match argv[0]` replaced by a static `OnceLock` dispatch table (`command_registry` → 15 `fn cmd_*` handlers, 27 names/aliases); adds `list-windows`, `list-panes`, `swap-pane`, `list-clients`, `show-options`, `run-shell`. The separate `loom-commands` crate (Registry/CmdQueue/nom parser + pure command stubs) stays available for standalone use; wiring it to the live `Server` (full context: pty, clients, broadcast) is deferred to a later round | ✅ |
 | B3 | Status line: reserve bottom row, `#{}`-driven session/window/pane bar, style from options | `status.c`, `format-draw.c` | ✅ |
 | B4 | Copy mode with vi keybindings over grid history | `window-copy.c` | ✅ (round 2) |
-| B5 | Mouse: pane focus, split drag, scroll in copy mode | `window-panes.c` mouse parts | |
+| B5 | Mouse: pane focus, split drag, scroll in copy mode | `window-panes.c` mouse parts | ✅ (round 3: pane focus + status window select + wheel scroll; split-drag resize deferred) |
 | B6 | Bell / activity flags on windows + status markers | `alerts.c` | ✅ (bell) |
 | B7 | Window titles via OSC 0/2 | `input.c` OSC | ✅ |
 | B8 | Options scoping (global/session/window/pane) + real defaults table | `options-table.c` | |
@@ -477,9 +478,37 @@ to execute it.
   untouched.
 - **Client** — `C-b [` binds to `copy-mode` and `C-b }` to `paste-buffer`
   in `keys.rs` (new `binding_for` entries + help text + tests).
-- Not covered yet: B5 mouse, B8 option scoping; status-line styling is still
+- Not covered yet: B8 option scoping; status-line styling is still
   hardcoded (B8). Copy-mode is vi-keys-only (no emacs mode, no search mode,
   no paste into the buffer from outside the server yet).
+
+**Implementation notes (Phase B, round 3 — B5 mouse)**
+
+- **SGR mouse decode (client)** — new `loom/src/mouse.rs`: `MouseDecoder`
+  accumulates the input byte stream and extracts `ESC [ < b ; x ; y M|m`
+  events into `MouseEvent { button, sx, sy, release }`; a trailing partial
+  report is buffered until it completes. Non-mouse bytes pass through
+  unchanged, so keystrokes are untouched. `run_attached` enables
+  `\x1b[?1000;1002;1006h` (button + drag-motion + SGR) on attach and
+  restores `\x1b[?1000;1002;1006l` on detach.
+- **Mouse message** — new `Message::Mouse { button, sx, sy, release }`
+  (protocol v9); the client sends one decoded event per report.
+- **Server dispatch** — `handle_mouse_event` converts to 0-based client
+  cells and routes:
+  * left press on a pane → `pane_at` hit-test → `set_active_pane` (focus);
+  * left press on the status row → `select_window_at_status` (matches the
+    window whose `" idx:name "` segment contains the column, accounting for
+    the leading session-name segment);
+  * wheel up (64) on a pane → focus + enter copy-mode + scroll up one line;
+  * wheel down (65) → scroll copy-mode down, exiting when back at the live
+    screen.
+  Only actual state changes trigger a redraw broadcast.
+- **Deferred** — split-drag resize (panes are resized via the border) is
+  left for a later round; the motion path (`-M`, button bit 32) is decoded
+  but not yet acted on.
+- Tests: `MouseDecoder` decode/partial-buffer/forward tests (client), and
+  `pane_at` hit-testing + `mouse_scroll_pane` enter/exit tests (server).
+  Total 110; 0 warnings.
 
 ### Phase C — parity & hardening (P2 +)
 
