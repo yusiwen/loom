@@ -9,6 +9,7 @@ use mio::unix::SourceFd;
 
 use loom_core::log::Logger;
 use loom_core::grid_cell::Grid;
+use loom_core::options::{Options, Scope};
 use loom_core::session::{
     CopyMode, PaneId, Session, SessionId, Window, WindowId, WindowPane, WINLINK_ALERTFLAGS,
     WINLINK_BELL, WINDOW_ACTIVITY, WINDOW_BELL,
@@ -107,6 +108,9 @@ pub struct Server {
     parsers: HashMap<PaneId, Parser>,
     /// Global paste buffer (last yank from copy-mode).
     paste_buffer: String,
+    /// Server-wide (global) options (B8). Sessions/windows/panes are child
+    /// options containers that inherit from these defaults.
+    global_options: Options,
     pub exit: bool,
 }
 
@@ -131,6 +135,7 @@ impl Server {
             next_pty_token: 0,
             parsers: HashMap::new(),
             paste_buffer: String::new(),
+            global_options: Options::with_defaults(),
             exit: false,
         })
     }
@@ -462,7 +467,7 @@ impl Server {
                 // content area.
                 let sid = client.session_id.unwrap_or(0);
                 let segments = status_segments(&self.sessions, &self.windows, sid, wid);
-                redraw::draw_status_line(tty, &segments);
+                redraw::draw_status_line(tty, window, &segments);
                 redraw::position_cursor(tty, window);
                 out = tty.take_output();
             }
@@ -531,11 +536,13 @@ impl Server {
 
                 // Record process info on the pane.
                 if let Some(window) = self.windows.get_mut(&wid) {
+                    let window_opts = window.options.clone();
                     if let Some(pane) = window.panes.get_mut(&pane_id) {
                         pane.fd = Some(master_fd);
                         pane.pid = Some(pid);
                         pane.shell = shell;
                         pane.cwd = cwd.to_string();
+                        pane.options.set_parent(window_opts);
                     }
                 }
             }
@@ -938,6 +945,8 @@ impl Server {
             // Client / introspection
             m.insert("list-clients", Self::cmd_list_clients);
             m.insert("show-options", Self::cmd_show_options);
+            m.insert("set-option", Self::cmd_set_option);
+            m.insert("set", Self::cmd_set_option);
             m.insert("run-shell", Self::cmd_run_shell);
             m.insert("copy-mode", Self::cmd_copy_mode);
             m.insert("paste-buffer", Self::cmd_paste_buffer);
@@ -964,8 +973,11 @@ impl Server {
         loom_core::log_debug!(self.log, "dispatch", "window size: {}x{}", sx, sy);
 
         let csy = content_sy(sy); // reserve the status row (B3)
+        let global = self.global_options.clone();
         let mut session = Session::new(None, &cwd);
-        let window = Window::new(sx, csy);
+        session.options.set_parent(global.clone());
+        let mut window = Window::new(sx, csy);
+        window.options.set_parent(session.options.clone());
         let wid = window.id;
         let sid = session.id;
 
@@ -1392,25 +1404,133 @@ impl Server {
         Ok(())
     }
 
-    fn cmd_show_options(&mut self, token: Token, _args: &[String]) -> io::Result<()> {
-        if let Some(client) = self.clients.get(&token) {
-            if let Some(sid) = client.session_id {
-                if let Some(session) = self.sessions.get(&sid) {
-                    let lines: Vec<String> = session
-                        .options
-                        .iter()
-                        .map(|e| format!("{} \"{:?}\"", e.name, e.value))
-                        .collect();
-                    let response = lines.join("\n");
-                    self.send_to(
-                        token,
-                        &Message::Command {
-                            argc: 0,
-                            argv: vec![";".into(), response],
-                        },
-                    )?;
+    /// show-options [-g|-s|-w|-p] — list options at a scope.
+    ///
+    /// Defaults to session scope for the requesting client. `-g` shows the
+    /// global table, `-s` session, `-w` window, `-p` the active pane.
+    fn cmd_show_options(&mut self, token: Token, args: &[String]) -> io::Result<()> {
+        let target = if args.contains(&"-g".to_string()) {
+            Scope::Global
+        } else if args.contains(&"-p".to_string()) {
+            Scope::Pane
+        } else if args.contains(&"-w".to_string()) {
+            Scope::Window
+        } else {
+            Scope::Session
+        };
+        let opts: Option<&Options> = match target {
+            Scope::Global => Some(&self.global_options),
+            Scope::Session => self
+                .clients
+                .get(&token)
+                .and_then(|c| c.session_id)
+                .and_then(|sid| self.sessions.get(&sid))
+                .map(|s| &s.options),
+            Scope::Window => self
+                .clients
+                .get(&token)
+                .and_then(|c| c.session_id)
+                .and_then(|sid| self.sessions.get(&sid))
+                .and_then(|s| s.current_winlink())
+                .and_then(|wl| self.windows.get(&wl.window_id))
+                .map(|w| &w.options),
+            Scope::Pane => self
+                .clients
+                .get(&token)
+                .and_then(|c| c.session_id)
+                .and_then(|sid| self.sessions.get(&sid))
+                .and_then(|s| s.current_winlink())
+                .and_then(|wl| self.windows.get(&wl.window_id))
+                .and_then(|w| w.active_pane_id)
+                .and_then(|pid| self.windows.values().find_map(|w| w.panes.get(&pid)))
+                .map(|p| &p.options),
+        };
+        let response = match opts {
+            Some(o) => o
+                .iter()
+                .map(|e| format!("{} \"{:?}\"", e.name, e.value))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            None => String::new(),
+        };
+        self.send_to(
+            token,
+            &Message::Command {
+                argc: 0,
+                argv: vec![";".into(), response],
+            },
+        )?;
+        Ok(())
+    }
+
+    /// set-option [-g|-s|-w|-p] <name> <value> — set an option at a scope.
+    /// `-g` sets the server global table; otherwise the requested client's
+    /// session/window/pane options (panes inherit from the window).
+    fn cmd_set_option(&mut self, token: Token, args: &[String]) -> io::Result<()> {
+        let mut target = Scope::Session;
+        let mut rest = args;
+        if rest.first().map(|s| s.starts_with('-')).unwrap_or(false) {
+            match rest.first().map(String::as_str) {
+                Some("-g") => target = Scope::Global,
+                Some("-s") => target = Scope::Session,
+                Some("-w") => target = Scope::Window,
+                Some("-p") | Some("-o") => target = Scope::Pane,
+                _ => {}
+            }
+            rest = &rest[1..];
+        }
+        if rest.len() < 2 {
+            self.send_to(
+                token,
+                &Message::Command {
+                    argc: 0,
+                    argv: vec![";".into(), "usage: set-option [-gsw] name value".into()],
+                },
+            )?;
+            return Ok(());
+        }
+        let name = rest[0].clone();
+        let value = rest[1].clone();
+        let opts: Option<&mut Options> = match target {
+            Scope::Global => Some(&mut self.global_options),
+            Scope::Session => self
+                .clients
+                .get(&token)
+                .and_then(|c| c.session_id)
+                .and_then(|sid| self.sessions.get_mut(&sid))
+                .map(|s| &mut s.options),
+            Scope::Window => self
+                .clients
+                .get(&token)
+                .and_then(|c| c.session_id)
+                .and_then(|sid| self.sessions.get_mut(&sid))
+                .and_then(|s| s.current_winlink().map(|wl| wl.window_id))
+                .and_then(|wid| self.windows.get_mut(&wid))
+                .map(|w| &mut w.options),
+            Scope::Pane => {
+                let target: Option<(WindowId, PaneId)> = self
+                    .clients
+                    .get(&token)
+                    .and_then(|c| c.session_id)
+                    .and_then(|sid| self.sessions.get(&sid))
+                    .and_then(|s| s.current_winlink().map(|wl| wl.window_id))
+                    .and_then(|wid| {
+                        self.windows
+                            .get(&wid)
+                            .and_then(|w| w.active_pane_id.map(|pid| (wid, pid)))
+                    });
+                match target {
+                    Some((wid, pid)) => self
+                        .windows
+                        .get_mut(&wid)
+                        .and_then(|w| w.panes.get_mut(&pid))
+                        .map(|p| &mut p.options),
+                    _ => None,
                 }
             }
+        };
+        if let Some(o) = opts {
+            let _ = o.set_value(&name, &value);
         }
         Ok(())
     }
@@ -1758,7 +1878,13 @@ impl Server {
                             .map(|w| (w.sx, w.sy))
                             .unwrap_or((80, 24));
                         let cwd = self.clients.get(&token).map(|c| c.cwd.clone()).unwrap_or_else(|| "/".into());
-                        let window = Window::new(sx, sy);
+                        let session_opts = self.sessions.get(&sid).map(|s| s.options.clone());
+                        let mut window = Window::new(sx, sy);
+                        if let Some(opts) = session_opts {
+                            window.options.set_parent(opts);
+                        } else {
+                            window.options.set_parent(self.global_options.clone());
+                        }
                         let new_wid = window.id;
                         self.windows.insert(new_wid, window);
                         self.spawn_pane(new_wid, sx, sy, &cwd);
@@ -1798,11 +1924,14 @@ impl Server {
                 }
                 self.parsers.insert(pane_id, Parser::new());
                 if let Some(window) = self.windows.get_mut(&wid) {
+                    // Pane options inherit from the window's options.
+                    let window_opts = window.options.clone();
                     if let Some(pane) = window.panes.get_mut(&pane_id) {
                         pane.fd = Some(master_fd);
                         pane.pid = Some(pid);
                         pane.shell = shell;
                         pane.cwd = cwd.to_string();
+                        pane.options.set_parent(window_opts);
                     }
                 }
                 Some(master_fd)
@@ -2314,5 +2443,31 @@ mod tests {
         assert!(server.mouse_scroll_pane(&wid, p1id, false));
         let pane = server.windows.get(&wid).unwrap().panes.get(&p1id).unwrap();
         assert!(!pane.copy.active);
+    }
+
+    /// B8: an options child inherits the defaults table and shadows with a
+    /// local set; the parent is unchanged.
+    #[test]
+    fn test_options_scope_shadows_parent() {
+        let mut global = Options::with_defaults();
+        global.set_value("set-titles", "0");
+        let window = Options::child_of(global);
+        // Unset value resolves through the parent.
+        assert_eq!(window.get_number("status-interval"), 15);
+        // The window's own set shadows the global default.
+        assert!(window.get_flag("set-titles") == false);
+    }
+
+    /// B8: `set-option -g` writes to the server global options.
+    #[test]
+    fn test_set_option_global_updates_server_options() {
+        let config = ServerConfig {
+            socket_path: format!("/tmp/loom-opt-{}.sock", std::process::id()),
+            socket_mode: 0o600,
+        };
+        let mut server = Server::new(config).unwrap();
+        assert_eq!(server.global_options.get_number("history-limit"), 2000);
+        server.global_options.set_value("history-limit", "500");
+        assert_eq!(server.global_options.get_number("history-limit"), 500);
     }
 }

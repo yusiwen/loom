@@ -374,12 +374,13 @@ Remaining follow-ups are noted under each item.
    `layout_resize` + `TIOCSWINSZ` in the `Resize` handler; layout unit tests
    cover reflow.
 8. all unit + golden tests pass — ✅ `cargo test --workspace` green
-   (114 passed, 0 failures, 0 warnings in this sandbox; +10 keybinding
+   (119 passed, 0 failures, 0 warnings in this sandbox; +10 keybinding
    state-machine tests and +2 status-line tests added in Phase B round 1,
    +9 in round 2: CopyMode state, 3x selection extraction, 2x copy-mode key
    handling, copy-mode rendering, prefix `[`/`}` bindings; +6 in round 3:
    4x mouse decode, pane_at hit-testing, mouse_scroll_pane enter/exit;
-   +4 in round 4: OSC title ST/BEL, DECCKM mode bit, OSC 8 hyperlink).
+   +4 in round 4: OSC title ST/BEL, DECCKM mode bit, OSC 8 hyperlink;
+   +5 in round 5: options defaults/scope tests + status-line option wiring).
 
 Note: KPIs 1, 2, 6 are exercised by `tests/interactive_smoke.rs`, which spawns a
 real PTY + shell and drives the wire protocol. It **skips itself** in sandboxes
@@ -397,7 +398,7 @@ to execute it.
 | B5 | Mouse: pane focus, split drag, scroll in copy mode | `window-panes.c` mouse parts | ✅ (round 3: pane focus + status window select + wheel scroll; split-drag resize deferred) |
 | B6 | Bell / activity flags on windows + status markers | `alerts.c` | ✅ (bell) |
 | B7 | Window titles via OSC 0/2 | `input.c` OSC | ✅ |
-| B8 | Options scoping (global/session/window/pane) + real defaults table | `options-table.c` | |
+| B8 | Options scoping (global/session/window/pane) + real defaults table | `options-table.c` | ✅ (round 5) |
 
 **Implementation notes (Phase B, round 1)**
 
@@ -531,6 +532,29 @@ to execute it.
   OSC 52/133 shell integration, G1/DEC special graphics charset.
 - Tests: OSC title (BEL + ST), DECCKM mode bit, OSC 8 hyperlink open/close.
   Total 114; 0 warnings.
+
+**Implementation notes (Phase B, round 5 — B8 options scoping)**
+
+- **Defaults table** — `loom-core::options::OPTIONS_TABLE` (static) holds a
+  real subset of tmux's options with scope + default value. `find_option()`
+  looks an entry up by name. `Options::with_defaults()` seeds a container
+  from the table so every lookup resolves to a concrete value.
+- **Scope model** — new `Scope` enum (Global/Session/Window/Pane). `Server`
+  owns `global_options` (from the defaults table); sessions are children of
+  global, windows children of the session, panes children of the window
+  (`set_parent`/`child_of`). A lookup walks child → parent, so an unset
+  value inherits and a local set shadows.
+- **Commands** — `show-options` gained `-g`/`-s`/`-w`/`-p` scope targets;
+  new `set-option` (alias `set`) sets a value at a scope via
+  `Options::set_value`, which parses numbers/flags/strings by the option's
+  declared type. Added to the command registry.
+- **Status-line styling from options** — `draw_status_line` now takes the
+  `Window` and `status_cell` reads `status-fg`/`status-bg`,
+  `status-active-*`, `status-alert-*` from the window's options (falling
+  back to the defaults table). Defaults are unchanged, so the golden tests
+  still pass byte-for-byte.
+- Tests: options defaults resolve, `set_value` type parsing, scope shadow, 
+  `set-option -g` writes to server global. Total 119; 0 warnings.
 
 ### Phase C — parity & hardening (P2 +)
 

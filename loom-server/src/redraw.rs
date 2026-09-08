@@ -1,4 +1,4 @@
-use loom_core::grid_cell::GridCell;
+use loom_core::grid_cell::{GridCell, GRID_ATTR_BRIGHT};
 use loom_core::session::{Window, WindowPane, WINDOW_ZOOMED};
 use loom_core::utf8::Utf8Data;
 use loom_tty::tty::Tty;
@@ -90,7 +90,7 @@ pub enum StatusStyle {
 /// Draw the status line on the bottom row (`sy - 1`) from pre-built segments.
 /// Uses the normal Tty cell-drawing path (cursor + SGR + chars), so an
 /// unchanged status line produces no output on subsequent redraws.
-pub fn draw_status_line(tty: &mut Tty, segments: &[(String, StatusStyle)]) {
+pub fn draw_status_line(tty: &mut Tty, window: &Window, segments: &[(String, StatusStyle)]) {
     let y = tty.sy.saturating_sub(1);
     let width = tty.sx;
     tty.tty_cursor(0, y);
@@ -100,7 +100,7 @@ pub fn draw_status_line(tty: &mut Tty, segments: &[(String, StatusStyle)]) {
         if x >= width {
             break;
         }
-        let cell = status_cell(*style);
+        let cell = status_cell(window, *style);
         for ch in text.chars() {
             if x >= width {
                 break;
@@ -114,7 +114,7 @@ pub fn draw_status_line(tty: &mut Tty, segments: &[(String, StatusStyle)]) {
     // Pad the remainder of the row with the base style.
     let pad = GridCell {
         data: Utf8Data::new(' '),
-        ..status_cell(StatusStyle::Normal)
+        ..status_cell(window, StatusStyle::Normal)
     };
     while x < width {
         tty.tty_cell(x, y, &pad);
@@ -125,19 +125,45 @@ pub fn draw_status_line(tty: &mut Tty, segments: &[(String, StatusStyle)]) {
     tty.tty_attributes(&reset);
 }
 
-/// GridCell style for a status-line segment.
-fn status_cell(style: StatusStyle) -> GridCell {
+/// GridCell style for a status-line segment, drawn from the window's options
+/// (B8): `status-fg`/`status-bg` for Normal, `status-active-*` for Active,
+/// `status-alert-*` for Alert. Options fall back to the defaults table.
+fn status_cell(window: &Window, style: StatusStyle) -> GridCell {
     use loom_core::colour::COLOUR_FLAG_256;
-    use loom_core::grid_cell::GRID_ATTR_BRIGHT;
-    let (fg, bg, attr) = match style {
-        StatusStyle::Normal => (250, 236, 0),
-        StatusStyle::Active => (16, 252, 0),
-        StatusStyle::Alert => (214, 236, GRID_ATTR_BRIGHT),
+    let o = &window.options;
+    let (mut fg, mut bg, mut attr): (i32, i32, u16) = match style {
+        StatusStyle::Normal => (
+            o.get_number("status-fg") as i32,
+            o.get_number("status-bg") as i32,
+            0,
+        ),
+        StatusStyle::Active => (
+            o.get_number("status-active-fg") as i32,
+            o.get_number("status-active-bg") as i32,
+            0,
+        ),
+        StatusStyle::Alert => (
+            o.get_number("status-alert-fg") as i32,
+            o.get_number("status-alert-bg") as i32,
+            GRID_ATTR_BRIGHT,
+        ),
     };
+    // A colour value of 8 means "default"; leave it unflagged when so.
+    if fg == 8 {
+        fg = 8;
+    } else {
+        fg |= COLOUR_FLAG_256;
+    }
+    if bg != 8 {
+        bg |= COLOUR_FLAG_256;
+    } else {
+        bg = 8;
+    }
+    attr &= 0xffff;
     GridCell {
-        fg: fg as i32 | COLOUR_FLAG_256,
-        bg: bg as i32 | COLOUR_FLAG_256,
-        attr: attr as u16,
+        fg: fg as i32,
+        bg: bg as i32,
+        attr,
         ..GridCell::default_cell()
     }
 }
@@ -203,12 +229,13 @@ mod tests {
     #[test]
     fn test_status_line_renders_bottom_row() {
         let mut tty = Tty::new(80, 24);
+        let window = Window::new(80, 24);
         let segments = vec![
             (" main ".to_string(), StatusStyle::Normal),
             (" 0:shell ".to_string(), StatusStyle::Active),
             (" *1:vim ".to_string(), StatusStyle::Alert),
         ];
-        draw_status_line(&mut tty, &segments);
+        draw_status_line(&mut tty, &window, &segments);
         let out = tty.take_output();
         let s = String::from_utf8_lossy(&out);
         // Cursor moved to the bottom row.
@@ -227,10 +254,11 @@ mod tests {
     #[test]
     fn test_status_line_redraw_has_no_cursor_flood() {
         let mut tty = Tty::new(80, 24);
+        let window = Window::new(80, 24);
         let segments = vec![(" main ".to_string(), StatusStyle::Normal)];
-        draw_status_line(&mut tty, &segments);
+        draw_status_line(&mut tty, &window, &segments);
         let first = tty.take_output();
-        draw_status_line(&mut tty, &segments);
+        draw_status_line(&mut tty, &window, &segments);
         let second = tty.take_output();
         // Re-drawing the identical line must not re-emit per-cell CUPs:
         // one positioning move plus the text, well under a full-screen blob.
