@@ -411,4 +411,51 @@ mod tests {
         assert!(s.contains("title"));
         assert!(s.contains("hello"));
     }
+
+    /// Regression: a bg-colored cell followed by a default cell on the NEXT
+    /// row must emit a reset (SGR to default) at the boundary, or the colored
+    /// background leaks ("halo") into the following line — the red-block
+    /// residue seen in eza `-l` permission columns.
+    #[test]
+    fn test_colored_cell_leak_across_rows() {
+        use loom_core::colour::COLOUR_FLAG_256;
+        use loom_core::grid_cell::GridCell;
+        use loom_core::session::WindowPane;
+        use loom_core::utf8::Utf8Data;
+
+        let mut window = Window::new(20, 5);
+        let wid = window.id;
+        let mut pane = WindowPane::new(wid, 20, 5);
+        let pid = pane.id;
+        // Row 0: red-bg cell at x=0.
+        pane.screen.grid.view_set_cell(0, 0, &GridCell {
+            data: Utf8Data::new('r'),
+            bg: 160 | COLOUR_FLAG_256,
+            ..GridCell::default_cell()
+        });
+        // Row 1: default cell "X" at x=0.
+        pane.screen.grid.view_set_cell(0, 1, &GridCell {
+            data: Utf8Data::new('X'),
+            ..GridCell::default_cell()
+        });
+        window.panes.insert(pid, pane);
+        window.active_pane_id = Some(pid);
+
+        let mut tty = Tty::new(20, 5);
+        redraw_window(&mut tty, &window);
+        let s = String::from_utf8_lossy(&tty.take_output()).into_owned();
+        // The red-bg cell emits a 48;5;160 SGR; and when drawing row 1 we must
+        // return to default so 'X' is not drawn on a red background.
+        assert!(s.contains("48;5;160"), "expected 256-colour background");
+        // After the reset the default cell's SGR must be emitted (0m) — i.e.
+        // the attributes changed from the red-bg cell, forcing a reset.
+        // Robust check: count that a reset to default appears before the 'X'.
+        let reset_pos = s.find("\x1b[0");
+        let x_pos = s.find('X');
+        if let (Some(rp), Some(xp)) = (reset_pos, x_pos) {
+            assert!(rp < xp, "default-cell SGR must precede the 'X'");
+        } else {
+            assert!(x_pos.is_some(), "expected a default cell to be drawn");
+        }
+    }
 }

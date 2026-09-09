@@ -1494,4 +1494,37 @@ mod tests {
         assert_eq!(screen.grid.view_get_cell(2, 0).unwrap().data.to_char(), 'D');
         assert_eq!(screen.grid.view_get_cell(7, 0).unwrap().data.to_char(), 'd');
     }
+
+    /// Regression (eza `-l` colored metadata): the permission field uses a
+    /// background color and the rest resets to default; the cells must keep
+    /// their exact fg/bg so the redraw emits the right SGR. The trailing
+    /// reset must NOT leave the rest of the row haloed.
+    #[test]
+    fn test_eza_l_colored_metadata_cells() {
+        let mut screen = Screen::new(80, 24);
+        let mut p = Parser::new();
+        // eza-like: red-bg permission, default reset, fg filename, reset.
+        p.parse_buf(
+            &mut screen,
+            b"\x1b[48;5;160m-rw-r--r--\x1b[0m @ 44k yusiwen 9 Sep 10:15 AUDIT.md\x1b[0m\r",
+        );
+        // Permission chars carry the red background (48;5;160 -> bg 160).
+        let pc = screen.grid.view_get_cell(0, 0).unwrap();
+        assert_eq!(pc.data.to_char(), '-');
+        assert_ne!(pc.bg & 0xffffff, 8, "permission cell should be bg-colored");
+        // Find the start of "AUDIT.md" and check it has default fg/bg/attr
+        // (the trailing reset cleared the permission background).
+        let mut name_row = 0usize;
+        for x in 0..80usize {
+            if screen.grid.view_get_cell(x as u32, 0).unwrap().data.to_char() == 'A' {
+                name_row = x;
+                break;
+            }
+        }
+        let fc = screen.grid.view_get_cell(name_row as u32, 0).unwrap();
+        assert_eq!(fc.data.to_char(), 'A');
+        assert_eq!(fc.fg, 8, "filename cell should have default fg");
+        assert_eq!(fc.bg, 8, "filename cell should have default bg");
+        assert_eq!(fc.attr, 0, "reset should have cleared attributes");
+    }
 }
