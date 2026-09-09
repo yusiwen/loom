@@ -374,7 +374,7 @@ Remaining follow-ups are noted under each item.
    `layout_resize` + `TIOCSWINSZ` in the `Resize` handler; layout unit tests
    cover reflow.
 8. all unit + golden tests pass — ✅ `cargo test --workspace` green
-   (127 passed, 0 failures, 0 warnings in this sandbox; +10 keybinding
+   (131 passed, 0 failures, 0 warnings in this sandbox; +10 keybinding
    state-machine tests and +2 status-line tests added in Phase B round 1,
    +9 in round 2: CopyMode state, 3x selection extraction, 2x copy-mode key
    handling, copy-mode rendering, prefix `[`/`}` bindings; +6 in round 3:
@@ -643,6 +643,28 @@ to execute it.
   frame (prefix + payload) in one write and confirms it round-trips. This
   reproduces the single-read coalescing the freeze needed.
 - 127 tests green, 0 warnings, goldens untouched.
+
+**Phase C round-12 notes (eza byte analysis)**
+
+- Verified the parser against the real bytes from `~/git/reading/eza`
+  (`eza --color=always -l`):
+  * `-l` colour set is tiny + standard: SGR fg codes (`\x1b[1;33m`,
+    `\x1b[32m`, …) and a bare `\x1b[0m` reset, plus literal spaces. There
+    are **no** cursor-move or tab tricks. The parser handles it verbatim
+    (test `test_real_eza_long_output_terminates_and_paints`).
+  * At a terminal eza wraps each filename in an OSC 8 hyperlink
+    (`\x1B]8;;file://path\x1B\x5C` … `\x1B]8;;\x1B\x5C`) interleaved with
+    SGR. The close tag returns the parser to Ground and the following SGR
+    keeps its colour (test `test_eza_hyperlink_interleaved_with_sgr`);
+    `active_link` is set/cleared correctly.
+  * Conclusion: the colour chaos / freeze are **not** escape-parsing bugs.
+    The freeze root cause is the IPC frame-desync fix above; the colour
+    layer (EL erase + row-boundary SGR reset) was already fixed. Colour
+    values are preserved per-cell through parse + redraw.
+- The sandbox cannot fake a TTY, so hyperlink bytes couldn't be captured
+  live; they were validated from eza's source (`src/output/file_name.rs`,
+  `src/output/escape.rs`) and reconstructed in the test.
+- 131 tests green, 0 warnings, goldens untouched.
 
 ### Suggested ordering rationale
 
