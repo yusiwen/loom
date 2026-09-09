@@ -374,14 +374,15 @@ Remaining follow-ups are noted under each item.
    `layout_resize` + `TIOCSWINSZ` in the `Resize` handler; layout unit tests
    cover reflow.
 8. all unit + golden tests pass — ✅ `cargo test --workspace` green
-   (124 passed, 0 failures, 0 warnings in this sandbox; +10 keybinding
+   (126 passed, 0 failures, 0 warnings in this sandbox; +10 keybinding
    state-machine tests and +2 status-line tests added in Phase B round 1,
    +9 in round 2: CopyMode state, 3x selection extraction, 2x copy-mode key
    handling, copy-mode rendering, prefix `[`/`}` bindings; +6 in round 3:
    4x mouse decode, pane_at hit-testing, mouse_scroll_pane enter/exit;
    +4 in round 4: OSC title ST/BEL, DECCKM mode bit, OSC 8 hyperlink;
    +5 in round 5: options defaults/scope tests + status-line option wiring;
-   +5 in rounds 6–9: option/token tests, layout presets, hooks, popup render).
+   +5 in rounds 6–9: option/token tests, layout presets, hooks, popup render;
+   +2 in round 10: colored-tab column alignment + shrunk-row erase-to-EOL).
 
 Note: KPIs 1, 2, 6 are exercised by `tests/interactive_smoke.rs`, which spawns a
 real PTY + shell and drives the wire protocol. It **skips itself** in sandboxes
@@ -611,6 +612,21 @@ to execute it.
   (bincode 3 / nix 0.31 / nom 8) — the dep bump changes the wire-format
   API (`bincode::serde::encode_to_vec`) and is deliberately deferred
   until a quiet window.
+
+**Phase C round-10 notes (renderer)**
+
+- **Shrunk-row erase-to-EOL fix** — `tty_draw_line` now emits `CSI K` (EL)
+  at the end of each drawn row when the cursor hasn't reached the right
+  edge. Without it a line that re-lays-out shorter (eza column, spinner,
+  shorter path) leaves stale trailing cells → the ghost/stray-column
+  artifact in colored multi-column listings. Full-width rows unchanged so
+  goldens stay byte-identical; cursor only repositioned when it differs.
+- **Colored-tab grid regression test** — a `\x1b[38;5;Nm…\x1b[0m\t…` line
+  through the parser lands each column at the real tabstop (0/16/32 for
+  8/10-char names), confirming TAB + inter-column SGR reset are correct.
+- eza itself was not reproducible in this sandbox (PTY denied + eza
+  long-view silent), so the exact symptom was pinned to the EL defect a
+  posteriori via the real redraw-path test rather than a direct capture.
 
 ### Suggested ordering rationale
 
