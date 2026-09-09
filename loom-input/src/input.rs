@@ -1527,4 +1527,80 @@ mod tests {
         assert_eq!(fc.bg, 8, "filename cell should have default bg");
         assert_eq!(fc.attr, 0, "reset should have cleared attributes");
     }
+
+    /// Real `eza --color=always -l` output (verbatim capture): parses without
+    /// hanging (the freeze) and leaves no raw escape bytes as visible screen
+    /// characters (the colour chaos). The sequence mix is tiny — colour codes
+    /// (`\x1b[1;33m` etc.) plus a bare `\x1b[0m` reset, plus literals.
+    #[test]
+    fn test_real_eza_long_output_terminates_and_paints() {
+        let mut screen = Screen::new(200, 50);
+        let mut p = Parser::new();
+        // Verbatim first ~2000 bytes of `eza --color=always -l`.
+        let bytes: &[u8] = &[
+            27,91,49,59,51,52,109,100,27,91,51,51,109,114,27,91,51,49,109,119,27,91,51,50,109,
+            120,27,91,48,109,27,91,51,51,109,114,27,91,49,59,57,48,109,45,27,91,48,109,27,91,
+            51,50,109,120,27,91,51,51,109,114,27,91,49,59,57,48,109,45,27,91,48,109,27,91,51,
+            50,109,120,27,91,48,109,64,32,32,32,32,27,91,49,59,57,48,109,45,27,91,48,109,32,
+            27,91,49,59,51,51,109,121,117,115,105,119,101,110,27,91,48,109,32,27,91,51,52,
+            109,32,57,32,83,101,112,32,49,51,58,52,56,27,91,48,109,32,32,32,54,32,27,91,49,
+            59,51,52,109,99,97,114,103,111,27,91,48,109,
+            27,91,49,51,51,109,111,27,91,51,49,109,119,27,91,57,48,109,45,27,91,48,109,27,91,
+            51,51,109,114,27,91,49,59,57,48,109,45,45,27,91,48,109,27,91,51,51,109,114,27,91,
+            49,59,57,48,109,45,45,27,91,48,109,64,32,27,91,49,59,51,50,109,52,46,49,107,27,
+            91,48,109,32,27,91,49,59,51,51,109,121,117,115,105,119,101,110,27,91,48,109,32,
+            27,91,51,52,109,32,57,32,83,101,112,32,49,51,58,52,56,27,91,48,109,32,32,32,27,
+            91,49,59,51,51,109,98,117,105,108,100,46,114,115,27,91,48,109,
+            10,
+        ];
+        let start = std::time::Instant::now();
+        p.parse_buf(&mut screen, bytes);
+        assert!(start.elapsed().as_secs() < 5, "eza parse must not hang");
+        // After parsing, the parser returns to Ground and no string body is
+        // left pending (a leaked OSC would swallow subsequent text).
+        assert!(p.string_kind.is_none(), "OSC body must be terminated");
+        // Exhaustively check no cell holds a raw ESC/control byte as a visible
+        // char (that would appear as garbage on screen).
+        for y in 0..screen.size_y() {
+            for x in 0..screen.size_x() {
+                let c = screen.grid.view_get_cell(x, y).unwrap().data.to_char();
+                if c < ' ' || c == '\x7f' {
+                    panic!("control byte {} leaked into visible cell ({},{})", c as u32, x, y);
+                }
+            }
+        }
+        // The filename "Cargo.lock" must be painted, not dropped.
+        let mut found = false;
+        for x in 0..screen.size_x() {
+            if screen.grid.view_get_cell(x, 0).unwrap().data.to_char() == 'o' {
+                found = true;
+                break;
+            }
+        }
+        assert!(found, "eza content should be painted");
+    }
+
+    /// eza at a terminal wraps each filename in an OSC 8 hyperlink
+    /// (`\x1B]8;;file://path\x1B\x5C` ... `\x1B]8;;\x1B\x5C`) interleaved with
+    /// SGR. The close tag (empty URI) must return the parser to Ground so the
+    /// following SGR + text are parsed normally — no swallowed text, no
+    /// colour leak.
+    #[test]
+    fn test_eza_hyperlink_interleaved_with_sgr() {
+        let mut screen = Screen::new(200, 50);
+        let mut p = Parser::new();
+        // open hyperlink, SGR, filename, close hyperlink, SGR, next col.
+        let bytes: &[u8] = b"\x1B]8;;file:///home/user/src/Cargo.toml\x1B\x5C\x1b[1;4;33mCargo.toml\x1b[0m\x1B]8;;\x1B\x5C\x1b[32mCHANGELOG.md\x1b[0m\r";
+        p.parse_buf(&mut screen, bytes);
+        assert!(p.string_kind.is_none(), "hyperlink must be closed (ST)");
+        // The filename chars are painted.
+        assert_eq!(screen.grid.view_get_cell(0, 0).unwrap().data.to_char(), 'C');
+        // Cell carries the hyperlink index.
+        assert_ne!(screen.grid.view_get_cell(0, 0).unwrap().link, 0);
+        // "Cargo.toml" begins at 0; "CHANGELOG.md" after it at x=10, and the
+        // second "C" must keep its own fg colour.
+        let ch = screen.grid.view_get_cell(10, 0).unwrap();
+        assert_eq!(ch.data.to_char(), 'C');
+        assert_ne!(ch.fg, 8, "CHANGELOG should keep its fg colour");
+    }
 }
