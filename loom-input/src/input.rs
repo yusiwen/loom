@@ -1471,4 +1471,27 @@ mod tests {
         let cell = screen.grid.view_get_cell(2, 0).unwrap();
         assert_eq!(cell.link, 0);
     }
+
+    /// Regression (eza-colored listing): a tab-separated, color-coded grid
+    /// line must land each column at the tabstop a real terminal uses, and a
+    /// stray SGR reset between columns must not shift offsets.
+    #[test]
+    fn test_colored_tab_grid_columns_align() {
+        let mut screen = Screen::new(80, 24);
+        let mut p = Parser::new();
+        // "AUDIT.md" fills cells 0..=7; cursor lands at 8. A TAB advances to
+        // the NEXT tabstop (16). "Cargo.lock" (10 chars) fills 16..=25 and the
+        // cursor lands at 26; a TAB then advances to 32 for "REWRITE.md".
+        p.parse_buf(
+            &mut screen,
+            b"\x1b[38;5;39mAUDIT.md\x1b[0m\t\x1b[38;5;2mCargo.lock\x1b[0m\tREWRITE.md\x1b[0m\r",
+        );
+        assert_eq!(screen.grid.view_get_cell(0, 0).unwrap().data.to_char(), 'A');
+        assert_eq!(screen.grid.view_get_cell(16, 0).unwrap().data.to_char(), 'C');
+        assert_eq!(screen.grid.view_get_cell(25, 0).unwrap().data.to_char(), 'k');
+        assert_eq!(screen.grid.view_get_cell(32, 0).unwrap().data.to_char(), 'R');
+        // The inter-column SGR reset must not leave stray characters behind.
+        assert_eq!(screen.grid.view_get_cell(2, 0).unwrap().data.to_char(), 'D');
+        assert_eq!(screen.grid.view_get_cell(7, 0).unwrap().data.to_char(), 'd');
+    }
 }

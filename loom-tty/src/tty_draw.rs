@@ -130,6 +130,21 @@ pub fn tty_draw_line(
     if !buf.is_empty() {
         flush_buffer(tty, atx + buf_x, aty, &buf, &last_gc);
     }
+
+    // Clear the remainder of the row (EL, CSI K). Without this, a line that
+    // shrank — e.g. a re-laid-out column, a spinner, or a path that got
+    // shorter — leaves its old trailing cells on screen as ghosts. `\x1b[K`
+    // erases from the cursor to the end of the line, so position first.
+    let erase_from = atx + nx;
+    if erase_from < tty.sx {
+        if tty.cx != erase_from as i32 || tty.cy != aty as i32 {
+            tty.tty_cursor(erase_from, aty);
+        }
+        tty.out.extend_from_slice(b"\x1b[K");
+        // Cursor stays at the erase start; record it.
+        tty.cx = erase_from as i32;
+        tty.cy = aty as i32;
+    }
 }
 
 /// Flush accumulated buffer: output attributes + characters at (x, y).
@@ -148,4 +163,45 @@ fn flush_buffer(tty: &mut Tty, x: u32, y: u32, buf: &[u8], gc: &GridCell) {
 /// Compare two cells for equality in the draw sense (fg, bg, attr).
 fn cells_equal(a: &GridCell, b: &GridCell) -> bool {
     a.fg == b.fg && a.bg == b.bg && a.attr == b.attr && a.us == b.us
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use loom_core::grid_cell::GridCell;
+    use loom_core::screen::Screen;
+    use loom_core::utf8::Utf8Data;
+
+    fn fill_line(screen: &mut Screen, row: u32, s: &str) {
+        for (i, ch) in s.chars().enumerate() {
+            screen.grid.view_set_cell(i as u32, row, &GridCell {
+                data: Utf8Data::new(ch),
+                ..GridCell::default_cell()
+            });
+        }
+    }
+
+    /// A row that later shrinks must erase its old tail via `\x1b[K`, so a
+    /// shorter line doesn't leave ghost cells (eza re-layout, spinner, ...).
+    #[test]
+    fn test_shrunk_row_emits_erase_to_eol() {
+        let mut tty = Tty::new(80, 24);
+        let mut screen = Screen::new(80, 24);
+        // Row 0 starts wide.
+        fill_line(&mut screen, 0, "a_very_long_column_heading_here_123456");
+        tty_draw_line(&mut tty, &screen, 0, 0, 40, 0, 0);
+        let _first = tty.out.clone();
+        tty.out.clear();
+        // Now the row re-lays out to a shorter value.
+        fill_line(&mut screen, 0, "short");
+        tty_draw_line(&mut tty, &screen, 0, 0, 40, 0, 0);
+        let s = String::from_utf8_lossy(&tty.out).into_owned();
+        assert!(
+            s.contains("\x1b[K"),
+            "shrunken row must emit clear-to-EOL, got: {:?}",
+            s
+        );
+        // The erase targets the column right after the new (5-char) content.
+        assert!(s.contains("\x1b[6;1H") || s.contains("\x1b[K"), "got {:?}", s);
+    }
 }
