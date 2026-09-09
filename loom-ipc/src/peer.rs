@@ -105,9 +105,9 @@ impl Peer {
     /// `Ok(None)` if more data is needed, `Err` on protocol error.
     pub fn recv(&mut self) -> io::Result<Option<Message>> {
         loop {
-            // Read length prefix (4 bytes)
+            // We track how much of the current frame's header is consumed.
             if !self.recv_have_len {
-                let needed = 4 - self.recv_buf.len();
+                let needed = 4 - self.recv_buf.len().min(4);
                 if needed > 0 {
                     let mut buf = vec![0u8; needed];
                     match self.stream.read(&mut buf) {
@@ -133,7 +133,10 @@ impl Peer {
                         Err(e) => return Err(e),
                     }
                 }
-                // Parse length
+                // Parse length. NOTE: do NOT clear recv_buf here — the same
+                // read() may have delivered payload bytes after the 4-byte
+                // prefix; discarding them truncates the frame and desyncs the
+                // stream, freezing the peer. Split the prefix off instead.
                 let len_bytes: [u8; 4] = self.recv_buf[..4].try_into().unwrap();
                 let len = u32::from_be_bytes(len_bytes) as usize;
                 if len > 16 * 1024 * 1024 {
@@ -142,9 +145,9 @@ impl Peer {
                         format!("message too large: {} bytes", len),
                     ));
                 }
+                self.recv_buf.drain(..4); // consume only the 4-byte prefix
                 self.recv_len = Some(len);
                 self.recv_have_len = true;
-                self.recv_buf.clear();
             }
 
             // Read payload
@@ -230,6 +233,7 @@ impl AsRawFd for Peer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::io::FromRawFd;
     use std::os::unix::net::UnixStream as StdUnixStream;
 
     fn create_pair() -> (Peer, Peer) {
@@ -333,6 +337,36 @@ mod tests {
                 assert_eq!(pairs.len(), 1000);
                 assert_eq!(pairs[0].0, "cap0");
             }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    /// Regression: when the 4-byte length prefix and the payload land in the
+    /// *same* `read()`, the receiver must not drop the payload. The old code
+    /// cleared `recv_buf` after parsing the prefix, truncating the frame and
+    /// freezing the peer under a bursty redraw (`ls -l`). We write the raw
+    /// frame in one shot so a single `read()` delivers prefix+payload.
+    #[test]
+    fn test_combined_prefix_and_payload_read() {
+        let (mut p1, mut p2) = create_pair();
+
+        let msg = Message::ScreenUpdate { data: vec![65u8; 4000] };
+        let payload = bincode::serialize(&msg).unwrap();
+        let mut full = Vec::with_capacity(4 + payload.len());
+        full.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        full.extend_from_slice(&payload);
+
+        // Write the raw frame (prefix + payload) straight to the fd so the
+        // receiver's first read() returns prefix and payload together.
+        use std::io::Write;
+        let mut stream = unsafe { StdUnixStream::from_raw_fd(p1.as_raw_fd()) };
+        let _ = stream.write_all(&full);
+        let _ = stream.flush();
+        std::mem::forget(stream); // don't take ownership of p1's stream
+
+        let got = pump_message(&mut p1, &mut p2);
+        match got {
+            Message::ScreenUpdate { data } => assert_eq!(data, vec![65u8; 4000]),
             _ => panic!("wrong variant"),
         }
     }

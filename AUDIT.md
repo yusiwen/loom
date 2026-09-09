@@ -374,7 +374,7 @@ Remaining follow-ups are noted under each item.
    `layout_resize` + `TIOCSWINSZ` in the `Resize` handler; layout unit tests
    cover reflow.
 8. all unit + golden tests pass — ✅ `cargo test --workspace` green
-   (126 passed, 0 failures, 0 warnings in this sandbox; +10 keybinding
+   (127 passed, 0 failures, 0 warnings in this sandbox; +10 keybinding
    state-machine tests and +2 status-line tests added in Phase B round 1,
    +9 in round 2: CopyMode state, 3x selection extraction, 2x copy-mode key
    handling, copy-mode rendering, prefix `[`/`}` bindings; +6 in round 3:
@@ -382,7 +382,8 @@ Remaining follow-ups are noted under each item.
    +4 in round 4: OSC title ST/BEL, DECCKM mode bit, OSC 8 hyperlink;
    +5 in round 5: options defaults/scope tests + status-line option wiring;
    +5 in rounds 6–9: option/token tests, layout presets, hooks, popup render;
-   +2 in round 10: colored-tab column alignment + shrunk-row erase-to-EOL).
+   +2 in round 10: colored-tab column alignment + shrunk-row erase-to-EOL;
+   +1 in round 11: IPC combined prefix+payload read regression).
 
 Note: KPIs 1, 2, 6 are exercised by `tests/interactive_smoke.rs`, which spawns a
 real PTY + shell and drives the wire protocol. It **skips itself** in sandboxes
@@ -627,6 +628,21 @@ to execute it.
 - eza itself was not reproducible in this sandbox (PTY denied + eza
   long-view silent), so the exact symptom was pinned to the EL defect a
   posteriori via the real redraw-path test rather than a direct capture.
+
+**Phase C round-11 notes (freeze / hang fix)**
+
+- **IPC frame-freeze fix** — `Peer::recv` parsed the 4-byte length prefix
+  and then did `recv_buf.clear()`, which *discarded any payload bytes that
+  arrived in the same `read()`* as the prefix. Under a bursty redraw (e.g.
+  `ls -l` → eza) a single read routinely returns prefix+payload together;
+  the damaged frame is then permanently incomplete, so `recv` waits forever
+  and the client freezes (no further input/output). Now the code `drain`s
+  only the 4-byte prefix and keeps the surplus payload in `recv_buf` for
+  the frame body (the enclosing `loop` already re-parses leftover bytes).
+- **Regression test** — `test_combined_prefix_and_payload_read` writes a raw
+  frame (prefix + payload) in one write and confirms it round-trips. This
+  reproduces the single-read coalescing the freeze needed.
+- 127 tests green, 0 warnings, goldens untouched.
 
 ### Suggested ordering rationale
 
