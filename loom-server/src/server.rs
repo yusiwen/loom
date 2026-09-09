@@ -2970,4 +2970,94 @@ mod tests {
         assert_eq!(server.sessions.get(&sid).unwrap().curw_idx, Some(0));
         assert!(!select_window_in(&mut server, sid, Some("99".to_string())));
     }
+
+    /// In-process freeze reproduction: the real PTY → parse → redraw → send
+    /// path must not hang under eza-style bursty colour output. We build a
+    /// server with a window/pane whose PTY is one end of a socketpair, and an
+    /// attached client holding the other end (a real Peer + Tty). Then we
+    /// flood process_pty_data and pump process_once. A hang blows the test
+    /// timeout rather than silently passing.
+    #[test]
+    fn test_bursty_pty_redraw_does_not_hang() {
+        use std::os::unix::net::UnixStream as StdUnixStream;
+
+        let config = ServerConfig {
+            socket_path: format!("/tmp/loom-burst-{}.sock", std::process::id()),
+            socket_mode: 0o600,
+        };
+        let mut server = Server::new(config).unwrap();
+
+        // socketpair: (pty_master, client_read) — pty_master is the pane's fd;
+        // client_read is the peer that receives ScreenUpdates.
+        let (pty_master, client_read) = StdUnixStream::pair().unwrap();
+        pty_master.set_nonblocking(true).unwrap();
+        client_read.set_nonblocking(true).unwrap();
+        let pty_fd = pty_master.as_raw_fd();
+
+        // Window + pane + parser + pty registration.
+        let mut window = Window::new(80, 24);
+        let wid = window.id;
+        let pane_id = {
+            let mut pane = WindowPane::new(wid, 80, 24);
+            let pid = pane.id;
+            pane.fd = Some(pty_fd);
+            server.parsers.insert(pid, Parser::new());
+            window.panes.insert(pid, pane);
+            window.active_pane_id = Some(pid);
+            window.pane_order.push_back(pid);
+            pid
+        };
+        server.windows.insert(wid, window);
+
+        // Session owning the window.
+        let mut session = Session::new(None, "/tmp");
+        session.attach_window(0, wid);
+        let sid = session.id;
+        server.sessions.insert(sid, session);
+
+        // Attached client with a real Peer + Tty, registered with the loop.
+        let client_token = Token(CLIENT_BASE + 9999);
+        server.next_client_token = 9999;
+        {
+            let stream = mio::net::UnixStream::from_std(client_read);
+            let mut client = ClientState {
+                peer: Peer::new(stream),
+                flags: 0,
+                session_id: Some(sid),
+                identified: true,
+                term_name: "xterm-256color".into(),
+                tty_name: String::new(),
+                cwd: "/tmp".into(),
+                pid: 0,
+                attached: true,
+                pending_size: Some((80, 24)),
+                tty: Some(Tty::new(80, 24)),
+                tty_initialized: true,
+            };
+            client
+                .peer
+                .register(server.poll.registry(), client_token, Interest::READABLE | Interest::WRITABLE)
+                .unwrap();
+            server.clients.insert(client_token, client);
+        }
+
+        // eza-style colour burst, repeated.
+        let bytes = b"\x1b[1;34md\x1b[33mr\x1b[31mw\x1b[32mx\x1b[0m\x1b[33mr\x1b[1;90m-\x1b[0m\x1b[32mx\x1b[0m@    \x1b[1;90m-\x1b[0m \x1b[1;33myusiwen\x1b[0m \x1b[34m 9 Sep 13:48\x1b[0m \x1b[1;34mbenches\x1b[0m\n".repeat(2000);
+
+        let start = std::time::Instant::now();
+        let mut guard = 0usize;
+        // Flood through process_pty_data (real path) then pump the event loop.
+        for chunk in bytes.chunks(1024) {
+            server.process_pty_data(pane_id, pty_fd, chunk);
+            let _ = server.process_once().unwrap();
+            // The client-side Peer never reads here (no draining), so the
+            // server's send_queue grows; pump a bounded number of iterations.
+            guard += 1;
+            if guard > 200_000 {
+                panic!("event loop did not settle after flood");
+            }
+        }
+        let elapsed = start.elapsed();
+        assert!(elapsed.as_secs() < 10, "bursty redraw path hung: {:?}", elapsed);
+    }
 }
