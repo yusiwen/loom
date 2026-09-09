@@ -374,7 +374,7 @@ Remaining follow-ups are noted under each item.
    `layout_resize` + `TIOCSWINSZ` in the `Resize` handler; layout unit tests
    cover reflow.
 8. all unit + golden tests pass — ✅ `cargo test --workspace` green
-   (131 passed, 0 failures, 0 warnings in this sandbox; +10 keybinding
+   (132 passed, 0 failures, 0 warnings in this sandbox; +10 keybinding
    state-machine tests and +2 status-line tests added in Phase B round 1,
    +9 in round 2: CopyMode state, 3x selection extraction, 2x copy-mode key
    handling, copy-mode rendering, prefix `[`/`}` bindings; +6 in round 3:
@@ -383,7 +383,9 @@ Remaining follow-ups are noted under each item.
    +5 in round 5: options defaults/scope tests + status-line option wiring;
    +5 in rounds 6–9: option/token tests, layout presets, hooks, popup render;
    +2 in round 10: colored-tab column alignment + shrunk-row erase-to-EOL;
-   +1 in round 11: IPC combined prefix+payload read regression).
+   +1 in round 11: IPC combined prefix+payload read regression;
+   +1 in round 12: real-eza-bytes + hyperlink-interleave parser tests;
+   +1 in round 13: in-process bursty PTY->parse->redraw->send path).
 
 Note: KPIs 1, 2, 6 are exercised by `tests/interactive_smoke.rs`, which spawns a
 real PTY + shell and drives the wire protocol. It **skips itself** in sandboxes
@@ -665,6 +667,25 @@ to execute it.
   live; they were validated from eza's source (`src/output/file_name.rs`,
   `src/output/escape.rs`) and reconstructed in the test.
 - 131 tests green, 0 warnings, goldens untouched.
+
+**Phase C round-13 notes (freeze reinvestigation)**
+
+- Built a faithful in-process reproduction of the server's real hot path:
+  a `UnixStream::pair` is used as the pane's PTY and an attached client
+  (real `Peer` + `Tty`) is driven by `process_pty_data` + `process_once`,
+  flooding 2000 eza-style colour lines. It completes in ~3.7 s with **no
+  hang** (test `test_bursty_pty_redraw_does_not_hang`).
+- Combined with the round-12 real-eza-byte parser test and the hyperlink
+  interleave test, this confirms: parser, renderer, and IPC framing are all
+  sound under eza-style bursts. **The freeze is not in the server-side data
+  path.**
+- Remaining hypothesis for a real-terminal freeze: the client-side
+  `run_attached` terminal interaction (true PTY), or the colour chaos
+  manifesting only at a real TTY where eza emits hyperlinks + long-column
+  output. Both need a live PTY to reproduce; the sandbox denies
+  `posix_openpt`. Getting a stack (`sample` on the frozen client/server) is
+  the decisive next step.
+- 132 tests green, 0 warnings, goldens untouched.
 
 ### Suggested ordering rationale
 
