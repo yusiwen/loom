@@ -24,16 +24,16 @@ use crate::redraw;
 use crate::spawn as spawner;
 
 /// Token for the accept listener.
-const ACCEPT_TOKEN: Token = Token(0);
+pub(crate) const ACCEPT_TOKEN: Token = Token(0);
 /// Signal notification token.
 #[allow(dead_code)]
 const SIGNAL_TOKEN: Token = Token(1);
 /// Waker token.
 const WAKER_TOKEN: Token = Token(2);
 /// First token for client peers.
-const CLIENT_BASE: usize = 256;
+pub(crate) const CLIENT_BASE: usize = 256;
 /// First token for PTY fds.
-const PTY_BASE: usize = 512;
+pub(crate) const PTY_BASE: usize = 512;
 
 /// Rows reserved for the status line at the bottom of the client terminal.
 /// Window/PTY content is sized to `terminal - STATUS_ROWS` rows (B3).
@@ -92,20 +92,20 @@ pub struct ClientState {
 /// The server manages sessions, windows, clients and the event loop.
 pub struct Server {
     config: ServerConfig,
-    poll: Poll,
+    pub(crate) poll: Poll,
     #[allow(dead_code)]
     waker: Waker,
     log: Option<Logger>,
-    clients: HashMap<Token, ClientState>,
+    pub(crate) clients: HashMap<Token, ClientState>,
     next_client_token: usize,
-    sessions: HashMap<SessionId, Session>,
-    windows: HashMap<WindowId, Window>,
+    pub(crate) sessions: HashMap<SessionId, Session>,
+    pub(crate) windows: HashMap<WindowId, Window>,
     listener: Option<std::os::unix::net::UnixListener>,
     /// Map PTY token → (master_fd, pane_id). One reader per PTY (mio event).
-    pty_fds: HashMap<Token, (RawFd, PaneId)>,
+    pub(crate) pty_fds: HashMap<Token, (RawFd, PaneId)>,
     next_pty_token: usize,
     /// Persistent per-pane input parsers (state survives across reads).
-    parsers: HashMap<PaneId, Parser>,
+    pub(crate) parsers: HashMap<PaneId, Parser>,
     /// Global paste buffer (last yank from copy-mode).
     paste_buffer: String,
     /// Server-wide (global) options (B8). Sessions/windows/panes are child
@@ -431,7 +431,7 @@ impl Server {
 
     /// Send a redraw to every client attached to `sid`.
     /// `full=true` forces a complete screen clear (used on attach/resize).
-    fn broadcast_redraw(&mut self, sid: SessionId, wid: WindowId, full: bool) {
+    pub(crate) fn broadcast_redraw(&mut self, sid: SessionId, wid: WindowId, full: bool) {
         let tokens: Vec<Token> = self
             .clients
             .iter()
