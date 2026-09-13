@@ -559,9 +559,48 @@ mod tests {
         assert!(screen.contains("benches"), "screen:\n{screen}");
     }
 
+    /// Regression: resizing the client terminal must resize the renderer's
+    /// `Tty`. Previously it was created once and never updated, so after a
+    /// resize loom kept drawing at the stale width — a p10k right prompt and
+    /// the status line were laid out for the old size and the right side of
+    /// the terminal stayed blank.
+    #[test]
+    fn resize_updates_client_tty_size() {
+        let mut h = loom_80x24();
+        h.settle();
+        h.client_send(&Message::Resize { sx: 120, sy: 30 });
+        h.settle();
+        let tty = h
+            .server
+            .clients
+            .get(&h.client_token)
+            .and_then(|c| c.tty.as_ref())
+            .expect("client tty");
+        assert_eq!(
+            (tty.sx, tty.sy),
+            (120, 30),
+            "client Tty must follow the terminal size"
+        );
+    }
 
-
-
-
-
+    /// Regression: a 0x0 resize (some PTYs report this before a size is
+    /// assigned) must be ignored. Accepting it spawns a 0-wide pane, so the
+    /// shell falls back to COLUMNS=80 and the prompt renders half-width.
+    #[test]
+    fn bogus_zero_resize_is_ignored() {
+        let mut h = loom_80x24();
+        h.settle();
+        h.client_send(&Message::Resize { sx: 0, sy: 0 });
+        h.settle();
+        let tty = h
+            .server
+            .clients
+            .get(&h.client_token)
+            .and_then(|c| c.tty.as_ref());
+        assert_eq!(
+            tty.map(|t| (t.sx, t.sy)),
+            Some((80, 24)),
+            "a 0x0 resize must not change the render size"
+        );
+    }
 }

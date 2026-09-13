@@ -275,13 +275,30 @@ fn connect_and_run(socket_path: &str, cmd_args: &[String]) -> io::Result<()> {
 
 fn get_terminal_size() -> (u32, u32) {
     let mut ws = nix::libc::winsize {
-        ws_row: 24,
-        ws_col: 80,
+        ws_row: 0,
+        ws_col: 0,
         ws_xpixel: 0,
         ws_ypixel: 0,
     };
-    unsafe { nix::libc::ioctl(0, nix::libc::TIOCGWINSZ, &mut ws); }
-    (ws.ws_col as u32, ws.ws_row as u32)
+    let rc = unsafe { nix::libc::ioctl(0, nix::libc::TIOCGWINSZ, &mut ws) };
+    let (cols, rows) = (ws.ws_col as u32, ws.ws_row as u32);
+    // Some terminals (and PTY bridges) never assign a window size, so the
+    // ioctl succeeds but reports 0x0. Sending that through creates a 0x0 pane
+    // whose shell falls back to COLUMNS=80 and the prompt renders half-width.
+    // Fall back to COLUMNS/LINES when exported, then to a sane default; the
+    // periodic resize check corrects it once a real size appears.
+    if rc != 0 || cols == 0 || rows == 0 {
+        if let (Some(c), Some(r)) = (
+            std::env::var("COLUMNS").ok().and_then(|v| v.parse::<u32>().ok()),
+            std::env::var("LINES").ok().and_then(|v| v.parse::<u32>().ok()),
+        ) {
+            if c > 0 && r > 0 {
+                return (c, r);
+            }
+        }
+        return (80, 24);
+    }
+    (cols, rows)
 }
 
 fn run_attached(peer: &mut Peer, log: Option<Logger>) -> io::Result<()> {

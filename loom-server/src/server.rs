@@ -451,7 +451,17 @@ impl Server {
                 None => return,
             };
             let (sx, sy) = client.pending_size.unwrap_or((80, 24));
-            if client.tty.is_none() {
+            // Recreate on first use *and* whenever the client's terminal has
+            // been resized. The old code only created it when absent, so after
+            // a resize the renderer kept drawing at the stale width/height —
+            // content past the old width (e.g. a p10k right prompt) was blank
+            // and the status line stayed on the old row.
+            let sized = client
+                .tty
+                .as_ref()
+                .is_some_and(|tty| tty.sx == sx && tty.sy == sy);
+            if !sized {
+                // A new Tty starts with no delta state, so it repaints fully.
                 client.tty = Some(Tty::new(sx, sy));
             }
             if full {
@@ -798,6 +808,20 @@ impl Server {
                 self.send_to(token, &Message::Exit)?;
             }
             Message::Resize { sx, sy } => {
+                // A 0x0 size would spawn/resize a pane with no cells and make
+                // the shell fall back to COLUMNS=80. Ignore it; the client
+                // sends a corrected size once the terminal reports one.
+                if sx == 0 || sy == 0 {
+                    loom_core::log_error!(
+                        self.log,
+                        "resize",
+                        "ignoring bogus size {}x{} from token={:?}",
+                        sx,
+                        sy,
+                        token
+                    );
+                    return Ok(());
+                }
                 if let Some(client) = self.clients.get_mut(&token) {
                     client.pending_size = Some((sx, sy));
                 }
@@ -1006,6 +1030,7 @@ impl Server {
             .clients
             .get(&token)
             .and_then(|c| c.pending_size)
+            .filter(|(sx, sy)| *sx > 0 && *sy > 0)
             .unwrap_or((80, 24));
         loom_core::log_debug!(self.log, "dispatch", "window size: {}x{}", sx, sy);
 
