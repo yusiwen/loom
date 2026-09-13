@@ -56,9 +56,7 @@ fn main() -> io::Result<()> {
                 if attempt == 0 {
                     loom_core::log_info!(log, "connect", "no server running, spawning one");
                     if let Ok(exe) = std::env::current_exe() {
-                        let _ = std::process::Command::new(&exe)
-                            .arg("start-server")
-                            .spawn();
+                        spawn_server_detached(&exe);
                     }
                 }
                 std::thread::sleep(Duration::from_millis(200));
@@ -75,6 +73,7 @@ fn main() -> io::Result<()> {
 }
 
 fn start_server(socket_path: &str) -> io::Result<()> {
+    install_crash_hook();
     let config = ServerConfig {
         socket_path: socket_path.to_string(),
         socket_mode: 0o600,
@@ -83,6 +82,69 @@ fn start_server(socket_path: &str) -> io::Result<()> {
     server.create_socket()?;
     server.run()?;
     Ok(())
+}
+
+/// Spawn the background server detached from the client's terminal.
+///
+/// The previous code inherited the client's stdio and process group, so the
+/// server's stderr was interleaved into the client's full-screen UI, and a
+/// Ctrl-C in the client (foreground process group) killed the server too.
+/// Detaching with `setsid` and routing stderr to `~/.loom/server.err` keeps the
+/// UI clean and preserves any panic output for diagnosis.
+fn spawn_server_detached(exe: &std::path::Path) {
+    use std::os::unix::process::CommandExt;
+
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+    let dir = std::path::PathBuf::from(&home).join(".loom");
+    let _ = std::fs::create_dir_all(&dir);
+
+    let mut cmd = std::process::Command::new(exe);
+    cmd.arg("start-server")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null());
+
+    match std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("server.err"))
+    {
+        Ok(f) => {
+            cmd.stderr(std::process::Stdio::from(f));
+        }
+        Err(_) => {
+            cmd.stderr(std::process::Stdio::null());
+        }
+    }
+
+    // New session: no controlling terminal, not in the client's process group.
+    unsafe {
+        cmd.pre_exec(|| {
+            nix::libc::setsid();
+            Ok(())
+        });
+    }
+    let _ = cmd.spawn();
+}
+
+/// Record panics to `~/.loom/crash.log` with a backtrace, so a wedged or dying
+/// server leaves evidence instead of silently disappearing.
+fn install_crash_hook() {
+    std::panic::set_hook(Box::new(|info| {
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+        let dir = std::path::PathBuf::from(&home).join(".loom");
+        let _ = std::fs::create_dir_all(&dir);
+        let backtrace = std::backtrace::Backtrace::force_capture();
+        let text = format!("[panic] {info}\n{backtrace}\n");
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(dir.join("crash.log"))
+        {
+            let _ = f.write_all(text.as_bytes());
+            let _ = f.flush();
+        }
+        eprintln!("loom server panic: {info}");
+    }));
 }
 
 fn send_msg(peer: &mut Peer, msg: &Message) -> io::Result<()> {
