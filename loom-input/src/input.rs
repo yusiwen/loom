@@ -743,8 +743,17 @@ fn dispatch_csi_command(p: &mut Parser, cmd: CsiType, screen: &mut Screen) {
                     49 => p.cell.bg = 8,
                     53 => p.cell.attr |= GRID_ATTR_OVERLINE,
                     55 => p.cell.attr &= !GRID_ATTR_OVERLINE,
-                    90..=97 => p.cell.fg = (s - 90 + 8) as i32,
-                    100..=107 => p.cell.bg = (s - 100 + 8) as i32,
+                    // Bright fg/bg (aixterm). Palette indices 8..15 must carry
+                    // COLOUR_FLAG_256: fg/bg value 8 without the flag is loom's
+                    // "default colour" sentinel, so flagging keeps
+                    // `\x1b[90m` (bright black) distinct from `\x1b[39m`
+                    // (default) and stops the renderer from dropping the colour.
+                    90..=97 => {
+                        p.cell.fg = (s - 90 + 8) | loom_core::colour::COLOUR_FLAG_256
+                    }
+                    100..=107 => {
+                        p.cell.bg = (s - 100 + 8) | loom_core::colour::COLOUR_FLAG_256
+                    }
                     _ => {}
                 }
                 i += 1;
@@ -1300,6 +1309,35 @@ mod tests {
 
         assert!(p.cell.attr & GRID_ATTR_BRIGHT != 0);
         assert_eq!(p.cell.fg, 1);
+    }
+
+    /// Regression: `\x1b[90m` (bright black) must not alias `\x1b[39m`
+    /// (default). Loom stores "default" as the bare value 8, so palette
+    /// entries 8..15 from the aixterm bright SGRs must set COLOUR_FLAG_256;
+    /// otherwise bright colours are silently dropped by the renderer.
+    #[test]
+    fn test_sgr_bright_colours_are_not_default() {
+        let mut screen = Screen::new(80, 24);
+        let mut p = Parser::new();
+
+        // Bright black fg (90) and bright red fg (91).
+        p.parse_buf(&mut screen, b"\x1b[90m");
+        assert_eq!(p.cell.fg, 8 | loom_core::colour::COLOUR_FLAG_256);
+        assert_ne!(p.cell.fg, 8, "90 must not alias the default sentinel");
+        p.parse_buf(&mut screen, b"\x1b[91m");
+        assert_eq!(p.cell.fg, 9 | loom_core::colour::COLOUR_FLAG_256);
+
+        // Default fg (39) drops the flag again.
+        p.parse_buf(&mut screen, b"\x1b[39m");
+        assert_eq!(p.cell.fg, 8, "39 is the default sentinel");
+
+        // Bright backgrounds 100..107 -> palette 8..15 with the flag.
+        p.parse_buf(&mut screen, b"\x1b[100m");
+        assert_eq!(p.cell.bg, 8 | loom_core::colour::COLOUR_FLAG_256);
+        p.parse_buf(&mut screen, b"\x1b[101m");
+        assert_eq!(p.cell.bg, 9 | loom_core::colour::COLOUR_FLAG_256);
+        p.parse_buf(&mut screen, b"\x1b[49m");
+        assert_eq!(p.cell.bg, 8, "49 is the default sentinel");
     }
 
     #[test]
