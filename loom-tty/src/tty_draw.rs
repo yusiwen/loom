@@ -43,7 +43,8 @@ pub fn tty_draw_line(
     let mut last_gc = default_cell;
     let mut i = 0;
     let mut buf_x = 0; // buffer start x
-    let mut buf = Vec::with_capacity(256); // buffered characters
+    let mut buf = Vec::with_capacity(256); // buffered characters (UTF-8 bytes)
+    let mut buf_cells = 0u32; // display columns held in `buf`
 
     while i < nx {
         let cell = grid
@@ -53,12 +54,14 @@ pub fn tty_draw_line(
         if cell.is_padding() || cell.is_cleared() {
             // Empty/padding cell — flush buffer and clear
             if !buf.is_empty() {
-                flush_buffer(tty, atx + buf_x, aty, &buf, &last_gc);
+                flush_buffer(tty, atx + buf_x, aty, &buf, buf_cells, &last_gc);
                 buf.clear();
+                buf_cells = 0;
             }
             tty.tty_cursor(atx + i, aty);
             tty.out.push(b' ');
-            tty.cx = (atx + i) as i32;
+            // The hardware cursor advanced one column past the space.
+            tty.cx = (atx + i + 1) as i32;
             i += 1;
             state = DrawState::Empty;
             continue;
@@ -95,13 +98,15 @@ pub fn tty_draw_line(
             match state {
                 DrawState::New1 | DrawState::New2 | DrawState::Same => {
                     if !buf.is_empty() {
-                        flush_buffer(tty, atx + buf_x, aty, &buf, &last_gc);
+                        flush_buffer(tty, atx + buf_x, aty, &buf, buf_cells, &last_gc);
                         buf.clear();
+                        buf_cells = 0;
                     }
                 }
                 DrawState::Flush => {
-                    flush_buffer(tty, atx + buf_x, aty, &buf, &last_gc);
+                    flush_buffer(tty, atx + buf_x, aty, &buf, buf_cells, &last_gc);
                     buf.clear();
+                    buf_cells = 0;
                 }
                 _ => {}
             }
@@ -115,8 +120,13 @@ pub fn tty_draw_line(
             buf_x = i;
         }
 
-        // Accumulate character
-        buf.push(ch as u8);
+        // Accumulate the character as full UTF-8. Truncating to one byte
+        // (`ch as u8`) corrupts every non-Latin-1 glyph — e.g. a p10k prompt's
+        // `❯` (U+276F) became 'o', and Nerd Font powerline glyphs turned into
+        // invalid UTF-8 that a terminal renders as U+FFFD.
+        let mut enc = [0u8; 4];
+        buf.extend_from_slice(ch.encode_utf8(&mut enc).as_bytes());
+        buf_cells += cell.data.width.max(1) as u32;
         last_gc = *cell;
 
         if cell.data.width > 1 {
@@ -128,7 +138,7 @@ pub fn tty_draw_line(
 
     // Final flush
     if !buf.is_empty() {
-        flush_buffer(tty, atx + buf_x, aty, &buf, &last_gc);
+        flush_buffer(tty, atx + buf_x, aty, &buf, buf_cells, &last_gc);
     }
 
     // Clear the remainder of the row (EL, CSI K). Without this, a line that
@@ -148,7 +158,9 @@ pub fn tty_draw_line(
 }
 
 /// Flush accumulated buffer: output attributes + characters at (x, y).
-fn flush_buffer(tty: &mut Tty, x: u32, y: u32, buf: &[u8], gc: &GridCell) {
+/// `cells` is the number of display columns the buffer occupies, so the
+/// tracked cursor lands at the next unwritten column.
+fn flush_buffer(tty: &mut Tty, x: u32, y: u32, buf: &[u8], cells: u32, gc: &GridCell) {
     tty.tty_cursor(x, y);
     tty.tty_attributes(gc);
     if buf.len() == 1 && buf[0] == b' ' && gc.attr == 0 && gc.fg == 8 && gc.bg == 8 {
@@ -156,8 +168,9 @@ fn flush_buffer(tty: &mut Tty, x: u32, y: u32, buf: &[u8], gc: &GridCell) {
     } else {
         tty.out.extend_from_slice(buf);
     }
-    // Update cursor tracking
-    tty.cx = (x + buf.len() as u32 - 1) as i32;
+    // Update cursor tracking to the next unwritten column.
+    tty.cx = (x + cells) as i32;
+    tty.cy = y as i32;
 }
 
 /// Compare two cells for equality in the draw sense (fg, bg, attr).
@@ -179,6 +192,21 @@ mod tests {
                 ..GridCell::default_cell()
             });
         }
+    }
+
+    /// Regression: non-Latin-1 glyphs must be emitted as full UTF-8. The old
+    /// `ch as u8` truncation turned a p10k `❯` (U+276F) into 'o' and corrupted
+    /// Nerd Font prompt glyphs into invalid bytes (terminal shows U+FFFD).
+    #[test]
+    fn test_multibyte_glyphs_are_emitted_as_utf8() {
+        let mut tty = Tty::new(80, 24);
+        let mut screen = Screen::new(80, 24);
+        fill_line(&mut screen, 0, "~/proj ❯ ●·");
+        tty_draw_line(&mut tty, &screen, 0, 0, 12, 0, 0);
+        let s = String::from_utf8(tty.out.clone()).expect("row output must be valid UTF-8");
+        assert!(s.contains('❯'), "prompt char must survive: {s:?}");
+        assert!(s.contains('●') && s.contains('·'), "glyphs must survive: {s:?}");
+        assert!(!s.contains('\u{fffd}'), "no replacement chars: {s:?}");
     }
 
     /// A row that later shrinks must erase its old tail via `\x1b[K`, so a
