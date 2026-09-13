@@ -368,62 +368,64 @@ fn run_attached(peer: &mut Peer, log: Option<Logger>) -> io::Result<()> {
             match event.token() {
                 STDIN_TOKEN => {
                     let mut buf = [0u8; 256];
+                    // fd 0 is blocking; one read per readiness event is safe.
+                    // (Only the peer socket is non-blocking and drained.)
                     match nix::unistd::read(0, &mut buf) {
-                        Ok(0) => {
-                            loom_core::log_debug!(log, "stdin", "EOF");
-                            return Ok(());
-                        }
-                        Ok(n) => {
-                            // (B5) Split mouse events out first; the rest are
-                            // keystrokes routed through the prefix-key machine.
-                            let (fwd, mouse_events) = mouse.feed(&buf[..n]);
-                            for ev in mouse_events {
-                                let _ = send_msg(peer, &Message::Mouse {
-                                    button: ev.button,
-                                    sx: ev.sx,
-                                    sy: ev.sy,
-                                    release: ev.release,
-                                });
+                            Ok(0) => {
+                                loom_core::log_debug!(log, "stdin", "EOF");
+                                return Ok(());
                             }
-                            let actions = keys.feed(&fwd);
-                            let mut detach = false;
-                            for action in actions {
-                                match action {
-                                    Action::Forward(bytes) => {
-                                        let _ = send_msg(peer, &Message::KeyPress { key: bytes });
-                                    }
-                                    Action::Command(argv) => {
-                                        let _ = send_msg(peer, &Message::Command {
-                                            argc: argv.len() as u32,
-                                            argv,
-                                        });
-                                    }
-                                    Action::Detach => {
-                                        loom_core::log_debug!(log, "prefix", "detach requested");
-                                        let _ = send_msg(peer, &Message::Detach);
-                                        detach = true;
-                                    }
-                                    Action::Echo(text) => {
-                                        let _ = io::stdout().write_all(text.as_bytes());
-                                        let _ = io::stdout().flush();
-                                    }
-                                    Action::Beep => {
-                                        let _ = io::stdout().write_all(b"\x07");
-                                        let _ = io::stdout().flush();
+                            Ok(n) => {
+                                // (B5) Split mouse events out first; the rest are
+                                // keystrokes routed through the prefix-key machine.
+                                let (fwd, mouse_events) = mouse.feed(&buf[..n]);
+                                for ev in mouse_events {
+                                    let _ = send_msg(peer, &Message::Mouse {
+                                        button: ev.button,
+                                        sx: ev.sx,
+                                        sy: ev.sy,
+                                        release: ev.release,
+                                    });
+                                }
+                                let actions = keys.feed(&fwd);
+                                let mut detach = false;
+                                for action in actions {
+                                    match action {
+                                        Action::Forward(bytes) => {
+                                            let _ = send_msg(peer, &Message::KeyPress { key: bytes });
+                                        }
+                                        Action::Command(argv) => {
+                                            let _ = send_msg(peer, &Message::Command {
+                                                argc: argv.len() as u32,
+                                                argv,
+                                            });
+                                        }
+                                        Action::Detach => {
+                                            loom_core::log_debug!(log, "prefix", "detach requested");
+                                            let _ = send_msg(peer, &Message::Detach);
+                                            detach = true;
+                                        }
+                                        Action::Echo(text) => {
+                                            let _ = io::stdout().write_all(text.as_bytes());
+                                            let _ = io::stdout().flush();
+                                        }
+                                        Action::Beep => {
+                                            let _ = io::stdout().write_all(b"\x07");
+                                            let _ = io::stdout().flush();
+                                        }
                                     }
                                 }
+                                let _ = peer.flush();
+                                if detach {
+                                    return Ok(());
+                                }
                             }
-                            let _ = peer.flush();
-                            if detach {
+                            Err(nix::errno::Errno::EAGAIN) => {}
+                            Err(e) => {
+                                loom_core::log_error!(log, "stdin", "read error: {}", e);
                                 return Ok(());
                             }
                         }
-                        Err(nix::errno::Errno::EAGAIN) => {}
-                        Err(e) => {
-                            loom_core::log_error!(log, "stdin", "read error: {}", e);
-                            return Ok(());
-                        }
-                    }
                 }
                 PEER_TOKEN => {
                     if event.is_error() || event.is_read_closed() || event.is_write_closed() {
@@ -431,31 +433,41 @@ fn run_attached(peer: &mut Peer, log: Option<Logger>) -> io::Result<()> {
                         return Ok(());
                     }
                     if event.is_readable() {
-                        match peer.recv()
-                            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("recv: {}", e)))?
-                        {
-                            Some(Message::ScreenUpdate { data }) => {
-                                loom_core::log_debug!(log, "screen", "got ScreenUpdate ({} bytes)", data.len());
-                                let _ = io::stdout().write_all(&data);
-                                let _ = io::stdout().flush();
-                            }
-                            Some(Message::Exit) | Some(Message::Exited) => {
-                                loom_core::log_debug!(log, "peer", "got Exit/Exited");
-                                return Ok(());
-                            }
-                            Some(Message::Command { argv, .. }) => {
-                                // Reply to a `:`-prompt command: print to stdout
-                                // so it is visible in the attached session.
-                                if argv.len() >= 2 && argv[0] == ";" {
-                                    loom_core::log_debug!(log, "peer", "command reply: {}", argv[1]);
-                                    let _ = io::stdout().write_all(format!("\r\n{}", argv[1]).as_bytes());
+                        // Edge-triggered: drain every buffered message. Reading
+                        // only one per event leaves the rest unread; the server's
+                        // socket then fills, no new edge arrives, and the session
+                        // deadlocks under a burst (large `eza -l`).
+                        loop {
+                            let msg = peer.recv().map_err(|e| {
+                                io::Error::new(io::ErrorKind::Other, format!("recv: {}", e))
+                            })?;
+                            let msg = match msg {
+                                Some(m) => m,
+                                None => break,
+                            };
+                            match msg {
+                                Message::ScreenUpdate { data } => {
+                                    loom_core::log_debug!(log, "screen", "got ScreenUpdate ({} bytes)", data.len());
+                                    let _ = io::stdout().write_all(&data);
                                     let _ = io::stdout().flush();
                                 }
+                                Message::Exit | Message::Exited => {
+                                    loom_core::log_debug!(log, "peer", "got Exit/Exited");
+                                    return Ok(());
+                                }
+                                Message::Command { argv, .. } => {
+                                    // Reply to a `:`-prompt command: print to stdout
+                                    // so it is visible in the attached session.
+                                    if argv.len() >= 2 && argv[0] == ";" {
+                                        loom_core::log_debug!(log, "peer", "command reply: {}", argv[1]);
+                                        let _ = io::stdout().write_all(format!("\r\n{}", argv[1]).as_bytes());
+                                        let _ = io::stdout().flush();
+                                    }
+                                }
+                                m => {
+                                    loom_core::log_debug!(log, "peer", "unexpected msg: {:?}", m);
+                                }
                             }
-                            Some(m) => {
-                                loom_core::log_debug!(log, "peer", "unexpected msg: {:?}", m);
-                            }
-                            None => {}
                         }
                     }
                     if event.is_writable() {
@@ -499,6 +511,7 @@ fn run_control(peer: &mut Peer, log: Option<Logger>) -> io::Result<()> {
             match event.token() {
                 STDIN_TOKEN => {
                     let mut buf = [0u8; 256];
+                    // fd 0 is blocking; one read per readiness event is safe.
                     match nix::unistd::read(0, &mut buf) {
                         Ok(0) => return Ok(()), // stdin EOF: exit
                         Ok(n) => {
@@ -533,21 +546,24 @@ fn run_control(peer: &mut Peer, log: Option<Logger>) -> io::Result<()> {
                 }
                 PEER_TOKEN => {
                     if event.is_readable() {
-                        match peer.recv() {
-                            Ok(Some(Message::Command { argv, .. })) => {
-                                if argv.first().map(|s| s.as_str()) == Some(";") {
-                                    let text = argv.get(1).cloned().unwrap_or_default();
-                                    let _ = io::stdout().write_all(text.as_bytes());
-                                    let _ = io::stdout().write_all(b"\n");
-                                    let _ = io::stdout().flush();
+                        // Edge-triggered: drain until the peer has no more.
+                        loop {
+                            match peer.recv() {
+                                Ok(Some(Message::Command { argv, .. })) => {
+                                    if argv.first().map(|s| s.as_str()) == Some(";") {
+                                        let text = argv.get(1).cloned().unwrap_or_default();
+                                        let _ = io::stdout().write_all(text.as_bytes());
+                                        let _ = io::stdout().write_all(b"\n");
+                                        let _ = io::stdout().flush();
+                                    }
                                 }
-                            }
-                            Ok(Some(Message::Exit)) => return Ok(()),
-                            Ok(Some(_)) => {}
-                            Ok(None) => {}
-                            Err(e) => {
-                                loom_core::log_error!(log, "ctrl", "recv error: {}", e);
-                                return Ok(());
+                                Ok(Some(Message::Exit)) => return Ok(()),
+                                Ok(Some(_)) => {}
+                                Ok(None) => break,
+                                Err(e) => {
+                                    loom_core::log_error!(log, "ctrl", "recv error: {}", e);
+                                    return Ok(());
+                                }
                             }
                         }
                     }
