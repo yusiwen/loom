@@ -1,0 +1,3 @@
+# Terminal byte streams used as test fixtures must keep their exact bytes
+# (CRLF endings, ESC sequences). Never apply end-of-line normalization.
+loom-server/tests/fixtures/*.raw -text

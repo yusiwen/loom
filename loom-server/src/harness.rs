@@ -22,213 +22,7 @@ use loom_ipc::peer::Peer;
 use mio::{Interest, Token};
 
 use crate::server::{ClientState, Server, ServerConfig, CLIENT_BASE, PTY_BASE};
-
-// ── Minimal VT emulator ─────────────────────────────────────────────────
-
-/// A small VT100 terminal emulator used to replay `ScreenUpdate` bytes.
-/// Understands printing, CR/LF/BS/TAB, CUP/ED/EL and plain SGR (attributes
-/// are ignored — we assert on text) plus wide characters (2 cells).
-pub struct Vt {
-    pub sx: u32,
-    pub sy: u32,
-    pub cells: Vec<Vec<char>>,
-    pub cx: u32,
-    pub cy: u32,
-}
-
-impl Vt {
-    pub fn new(sx: u32, sy: u32) -> Self {
-        Self {
-            sx,
-            sy,
-            cells: vec![vec![' '; sx as usize]; sy as usize],
-            cx: 0,
-            cy: 0,
-        }
-    }
-
-    pub fn feed(&mut self, data: &[u8]) {
-        let mut i = 0usize;
-        while i < data.len() {
-            let b = data[i];
-            match b {
-                0x1b => {
-                    if i + 1 < data.len() && data[i + 1] == b'[' {
-                        let mut j = i + 2;
-                        let start = j;
-                        while j < data.len() && !(0x40..=0x7e).contains(&data[j]) {
-                            j += 1;
-                        }
-                        if j >= data.len() {
-                            break;
-                        }
-                        let params = String::from_utf8_lossy(&data[start..j]).to_string();
-                        let fin = data[j];
-                        self.csi(&params, fin);
-                        i = j + 1;
-                    } else if i + 1 < data.len() && data[i + 1] == b']' {
-                        // OSC: skip to BEL or ST
-                        let mut j = i + 2;
-                        while j < data.len() && data[j] != 0x07 {
-                            if data[j] == 0x1b && j + 1 < data.len() && data[j + 1] == b'\\' {
-                                j += 1;
-                                break;
-                            }
-                            j += 1;
-                        }
-                        i = (j + 1).min(data.len());
-                    } else {
-                        i += 2;
-                    }
-                }
-                0x07 => i += 1,
-                0x08 => {
-                    self.cx = self.cx.saturating_sub(1);
-                    i += 1;
-                }
-                0x09 => {
-                    self.cx = ((self.cx / 8) + 1) * 8;
-                    if self.cx >= self.sx {
-                        self.cx = self.sx.saturating_sub(1);
-                    }
-                    i += 1;
-                }
-                0x0a | 0x0b | 0x0c => {
-                    // Plain LF: looms emits CR/LF, so treat LF as down-only
-                    // here (CR handled separately) like a real terminal.
-                    self.cy = (self.cy + 1).min(self.sy.saturating_sub(1));
-                    i += 1;
-                }
-                0x0d => {
-                    self.cx = 0;
-                    i += 1;
-                }
-                _ => {
-                    let len = utf8_len(b);
-                    if i + len > data.len() {
-                        break;
-                    }
-                    let s = String::from_utf8_lossy(&data[i..i + len]).to_string();
-                    if let Some(c) = s.chars().next() {
-                        self.put(c);
-                    }
-                    i += len;
-                }
-            }
-        }
-    }
-
-    fn put(&mut self, c: char) {
-        if self.cx >= self.sx || self.cy >= self.sy {
-            return;
-        }
-        let wide = is_wide(c);
-        let x = self.cx as usize;
-        let y = self.cy as usize;
-        if y < self.cells.len() && x < self.cells[y].len() {
-            self.cells[y][x] = c;
-            if wide && x + 1 < self.cells[y].len() {
-                self.cells[y][x + 1] = ' ';
-            }
-        }
-        self.cx = (self.cx + if wide { 2 } else { 1 }).min(self.sx);
-    }
-
-    fn csi(&mut self, params: &str, fin: u8) {
-        let p: Vec<i64> = params
-            .trim_start_matches('?')
-            .split(';')
-            .map(|s| s.parse::<i64>().unwrap_or(0))
-            .collect();
-        let arg = |idx: usize, dflt: i64| -> i64 {
-            if idx < p.len() && p[idx] != 0 {
-                p[idx]
-            } else {
-                dflt
-            }
-        };
-        match fin {
-            b'H' | b'f' => {
-                self.cy = ((arg(0, 1).max(1) - 1) as u32).min(self.sy.saturating_sub(1));
-                self.cx = ((arg(1, 1).max(1) - 1) as u32).min(self.sx.saturating_sub(1));
-            }
-            b'A' => self.cy = self.cy.saturating_sub(arg(0, 1) as u32),
-            b'B' => self.cy = (self.cy + arg(0, 1) as u32).min(self.sy.saturating_sub(1)),
-            b'C' => self.cx = (self.cx + arg(0, 1) as u32).min(self.sx.saturating_sub(1)),
-            b'D' => self.cx = self.cx.saturating_sub(arg(0, 1) as u32),
-            b'G' => self.cx = ((arg(0, 1).max(1) - 1) as u32).min(self.sx.saturating_sub(1)),
-            b'd' => self.cy = ((arg(0, 1).max(1) - 1) as u32).min(self.sy.saturating_sub(1)),
-            b'J' => {
-                if p.first().copied().unwrap_or(0) == 2 {
-                    for row in self.cells.iter_mut() {
-                        for cell in row.iter_mut() {
-                            *cell = ' ';
-                        }
-                    }
-                }
-            }
-            b'K' => {
-                let mode = p.first().copied().unwrap_or(0);
-                let y = self.cy as usize;
-                if y < self.cells.len() {
-                    let (from, to) = match mode {
-                        1 => (0usize, self.cx as usize + 1),
-                        2 => (0usize, self.sx as usize),
-                        _ => (self.cx as usize, self.sx as usize),
-                    };
-                    let len = self.cells[y].len();
-                    for x in from..to.min(len) {
-                        self.cells[y][x] = ' ';
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-
-    pub fn lines(&self) -> Vec<String> {
-        self.cells
-            .iter()
-            .map(|row| row.iter().collect::<String>().trim_end().to_string())
-            .collect()
-    }
-
-    pub fn text(&self) -> String {
-        self.lines().join("\n")
-    }
-
-    pub fn row(&self, y: u32) -> String {
-        self.cells
-            .get(y as usize)
-            .map(|r| r.iter().collect::<String>().trim_end().to_string())
-            .unwrap_or_default()
-    }
-}
-
-fn utf8_len(b: u8) -> usize {
-    if b < 0x80 {
-        1
-    } else if b >= 0xf0 {
-        4
-    } else if b >= 0xe0 {
-        3
-    } else if b >= 0xc0 {
-        2
-    } else {
-        1
-    }
-}
-
-fn is_wide(c: char) -> bool {
-    let code = c as u32;
-    (0x1100..=0x115F).contains(&code)
-        || (0x2E80..=0xA4CF).contains(&code)
-        || (0xAC00..=0xD7A3).contains(&code)
-        || (0xF900..=0xFAFF).contains(&code)
-        || (0xFF00..=0xFF60).contains(&code)
-        || (0x1F300..=0x1F9FF).contains(&code)
-        || (0x20000..=0x3FFFD).contains(&code)
-}
+use crate::vt::Vt;
 
 // ── Harness ─────────────────────────────────────────────────────────────
 
@@ -472,6 +266,62 @@ pub fn loom_80x24() -> Loom {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use loom_core::colour::COLOUR_FLAG_256;
+    use loom_core::grid_cell::GRID_ATTR_BRIGHT;
+
+    /// Colours must survive the full pane-PTY -> parse -> redraw -> client
+    /// path. This is the automated form of "loom's colours look wrong":
+    /// the client terminal's cells are compared against what the shell sent.
+    #[test]
+    fn colours_survive_the_round_trip() {
+        let mut h = loom_80x24();
+        h.shell_print(b"\x1b[31mR\x1b[0m \x1b[1;90mD\x1b[0m\r\n");
+
+        // 'R' is basic red (palette 1) — the old renderer rewrote this to
+        // SGR 39 (default) and dropped the colour entirely.
+        assert_eq!(
+            h.vt.fg_at(0, 0),
+            1,
+            "basic red must survive; screen:\n{}",
+            h.screen()
+        );
+        // The inter-column space returns to default.
+        assert_eq!(h.vt.fg_at(1, 0), 8, "space must be default fg");
+        // 'D' is `1;90` = bold + bright black, exactly what eza emits for the
+        // permission dashes. 90 must not collapse into the default sentinel.
+        let dash = h.vt.cell_at(2, 0).expect("dash cell");
+        assert_eq!(
+            dash.fg,
+            8 | COLOUR_FLAG_256,
+            "bright black must not alias default; screen:\n{}",
+            h.screen()
+        );
+        assert_ne!(dash.attr & GRID_ATTR_BRIGHT, 0, "bold must survive");
+        assert_eq!(h.vt.fg_at(3, 0), 8, "trailing default cell");
+    }
+
+    /// Real bytes captured from `eza -l --color=always` in a real PTY
+    /// (`tests/fixtures/eza_l.raw`). Feeding them through the production
+    /// parse+redraw path must paint the same colours eza asked for.
+    #[test]
+    fn real_eza_bytes_paint_expected_colours() {
+        const EZA: &[u8] = include_bytes!("../tests/fixtures/eza_l.raw");
+        let mut h = loom_80x24();
+        h.shell_print(EZA);
+        let row0 = h.vt.row(0);
+        assert!(row0.starts_with(".rw"), "row0: {row0:?}");
+        // ".rw-------": '.' default, 'r' bold yellow (3), 'w' red (1),
+        // then the '-' run is bright black (palette 8).
+        assert_eq!(h.vt.fg_at(0, 0), 8, "leading dot is default");
+        assert_eq!(h.vt.fg_at(1, 0), 3, "r is yellow");
+        assert_ne!(h.vt.attr_at(1, 0) & GRID_ATTR_BRIGHT, 0, "r is bold");
+        assert_eq!(h.vt.fg_at(2, 0), 1, "w is red");
+        assert_eq!(
+            h.vt.fg_at(3, 0),
+            8 | COLOUR_FLAG_256,
+            "permission dashes are bright black"
+        );
+    }
 
     /// Smoke: the harness brings up a screen (status line present) and the
     /// client sees it.
